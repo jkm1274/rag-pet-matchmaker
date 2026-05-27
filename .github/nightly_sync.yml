@@ -1,0 +1,49 @@
+# .github/workflows/nightly_sync.yml
+#
+# Runs the Petfinder sync every night at 3 AM ET (08:00 UTC).
+# Also runnable manually from the GitHub Actions UI.
+#
+# Required repository secrets (Settings → Secrets → Actions):
+#   PETFINDER_API_KEY
+#   PETFINDER_API_SECRET
+#   OPENAI_API_KEY
+#
+# The ChromaDB and SQLite files are ephemeral in CI — this workflow is
+# designed for a deployment where the sync runs ON the server (e.g. a
+# Render cron job or a VPS crontab). Use this file as a template for
+# those environments, or adapt it to commit the DB files to a branch
+# if you want a fully serverless setup.
+
+name: Nightly Petfinder Sync
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 03:00 ET (UTC-5) / 04:00 EDT (UTC-4)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          PETFINDER_API_KEY: ${{ secrets.PETFINDER_API_KEY }}
+          PETFINDER_API_SECRET: ${{ secrets.PETFINDER_API_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SYNC_LOCATION: "08817"
+          SYNC_DISTANCE_MILES: "25"
+          SYNC_MAX_PAGES: "10"
+        run: python -m src.ingestion.sync
