@@ -1,19 +1,8 @@
 """
 src/ingestion/rescuegroups_transformer.py
 
-Transforms raw RescueGroups v5 API animal records into the normalised
-format used by the rest of the pipeline (LangChain Documents + SQLite).
-
-RescueGroups has a richer schema than Petfinder:
-  - energyLevel, activityLevel, exerciseNeeds
-  - isYardRequired, fenceNeeds
-  - isCatsOk, isDogsOk, isKidsOk, isSeniorsOk
-  - obedienceTraining, ownerExperience
-  - vocalLevel, sheddingLevel, groomingNeeds
-  - descriptionText (clean, no HTML)
-
-All of these feed directly into the embedding content, making
-retrieval quality significantly better than the mock CSV.
+Transforms raw HTTP/JSON API animal records into LangChain Documents.
+Field names follow the HTTP/JSON API v2 schema (animalXxx, orgXxx).
 """
 
 from __future__ import annotations
@@ -26,227 +15,215 @@ from langchain_core.documents import Document
 logger = logging.getLogger(__name__)
 
 
-def _safe(value: Any, fallback: str = "Unknown") -> str:
+def _s(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
     s = str(value).strip()
     return s if s else fallback
 
 
-def _bool_label(value: Optional[bool], true_str: str, false_str: str) -> str:
-    if value is True:
-        return true_str
-    if value is False:
-        return false_str
-    return "Unknown"
+def _yes(value: Any) -> Optional[bool]:
+    """Convert Yes/No/None string to bool."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v == "yes": return True
+    if v == "no":  return False
+    return None
 
 
-def _build_bio(a: Dict[str, Any]) -> str:
-    """
-    Build a rich biography string from RescueGroups attributes.
-    Falls back gracefully when fields are missing.
-    """
+def _build_bio(a: Dict[str, Any], org: Dict[str, Any]) -> str:
+    """Build a rich biography from HTTP/JSON API animal attributes."""
     parts: List[str] = []
-    name = _safe(a.get("name"), "This animal")
-    species = _safe(a.get("_species") or a.get("species"), "pet")
-    breed = _safe(a.get("_breed_primary") or a.get("breedString"), "Mixed breed")
-    secondary = a.get("_breed_secondary") or a.get("breedSecondary")
-    mixed = a.get("isBreedMixed", False)
+    name    = _s(a.get("animalName"), "This animal")
+    species = _s(a.get("animalSpecies"), "pet")
+    breed   = _s(a.get("animalBreed") or a.get("animalPrimaryBreed"), "Mixed breed")
+    mixed   = str(a.get("animalMixedBreed", "")).lower() == "yes"
+    breed_str = f"{breed} mix" if mixed else breed
+    age     = _s(a.get("animalGeneralAge") or a.get("animalAgeString"))
+    sex     = _s(a.get("animalSex"))
+    size    = _s(a.get("animalGeneralSizePotential") or a.get("animalSizeCurrent"))
 
-    breed_str = breed
-    if mixed and secondary:
-        breed_str = f"{breed}/{secondary} mix"
-    elif mixed:
-        breed_str = f"{breed} mix"
+    # Opener
+    parts_opener = [p for p in [age.lower(), sex.lower(), breed_str, species.lower()] if p]
+    parts.append(f"{name} is a {' '.join(parts_opener)}.")
 
-    age_group = _safe(a.get("ageGroup"), "")
-    sex = _safe(a.get("sex"), "")
-    size = _safe(a.get("sizeGroup"), "")
+    # Energy & activity
+    energy   = a.get("animalEnergyLevel")
+    activity = a.get("animalActivityLevel")
+    exercise = a.get("animalExerciseNeeds")
+    notes = []
+    if energy:   notes.append(f"{energy.lower()} energy")
+    if activity: notes.append(f"{activity.lower()} activity")
+    if exercise: notes.append(f"{exercise.lower()} exercise needs")
+    if notes: parts.append(f"{name} has {', '.join(notes)}.")
 
-    # ── Opener ────────────────────────────────────────────────────────────
-    opener_parts = [p for p in [age_group.lower(), sex.lower(), breed_str, species.lower()] if p and p != "unknown"]
-    parts.append(f"{name} is a {' '.join(opener_parts)}.")
+    # Living situation
+    yard    = _yes(a.get("animalYardRequired"))
+    apt     = _yes(a.get("animalApartment"))
+    indoor  = a.get("animalIndoorOutdoor")
+    fence   = a.get("animalFence")
+    living  = []
+    if yard is True:            living.append("requires a yard")
+    if yard is False or apt is True: living.append("suitable for apartment living")
+    if fence and fence not in ("", "No"): living.append(f"needs a {fence.lower()} fence")
+    if indoor:                  living.append(f"is {indoor.lower()}")
+    if living: parts.append(f"{name} {', '.join(living)}.")
 
-    # ── Energy & activity ─────────────────────────────────────────────────
-    energy = a.get("energyLevel")
-    activity = a.get("activityLevel")
-    exercise = a.get("exerciseNeeds")
-    if any([energy, activity, exercise]):
-        notes = []
-        if energy:    notes.append(f"{energy.lower()} energy")
-        if activity:  notes.append(f"{activity.lower()} activity level")
-        if exercise:  notes.append(f"{exercise.lower()} exercise needs")
-        parts.append(f"{name} has {', '.join(notes)}.")
-
-    # ── Living situation ───────────────────────────────────────────────────
-    yard = a.get("isYardRequired")
-    fence = a.get("fenceNeeds")
-    indoor = a.get("indoorOutdoor")
-    living_notes = []
-    if yard is True:   living_notes.append("requires a yard")
-    if yard is False:  living_notes.append("does not require a yard — suitable for apartment living")
-    if fence and fence != "Not required":
-        living_notes.append(f"needs a {fence.lower()} fence")
-    if indoor:         living_notes.append(f"is {indoor.lower()}")
-    if living_notes:
-        parts.append(f"{name} {', '.join(living_notes)}.")
-
-    # ── Compatibility ──────────────────────────────────────────────────────
+    # Compatibility
     compat = []
-    if a.get("isKidsOk") is True:    compat.append("good with children")
-    if a.get("isKidsOk") is False:   compat.append("not recommended for homes with children")
-    if a.get("isDogsOk") is True:    compat.append("good with other dogs")
-    if a.get("isDogsOk") is False:   compat.append("should be the only dog in the home")
-    if a.get("isCatsOk") is True:    compat.append("good with cats")
-    if a.get("isCatsOk") is False:   compat.append("not suitable for homes with cats")
-    if a.get("isSeniorsOk") is True: compat.append("great with seniors")
-    if compat:
-        parts.append(f"{name} is {', '.join(compat)}.")
+    if _yes(a.get("animalOKWithKids")) is True:    compat.append("good with children")
+    if _yes(a.get("animalOKWithKids")) is False:   compat.append("not recommended for homes with children")
+    if _yes(a.get("animalOKWithDogs")) is True:    compat.append("good with dogs")
+    if _yes(a.get("animalOKWithDogs")) is False:   compat.append("should be the only dog")
+    if _yes(a.get("animalOKWithCats")) is True:    compat.append("good with cats")
+    if _yes(a.get("animalOKWithCats")) is False:   compat.append("not suitable with cats")
+    if _yes(a.get("animalOKForSeniors")) is True:  compat.append("great with seniors")
+    if compat: parts.append(f"{name} is {', '.join(compat)}.")
 
-    # ── Training & experience ──────────────────────────────────────────────
-    training = a.get("obedienceTraining")
-    experience = a.get("ownerExperience")
-    if training:   parts.append(f"Training: {training}.")
-    if experience and experience != "None":
-        parts.append(f"Best suited for an owner with {experience.lower()} experience.")
+    # Training
+    training    = a.get("animalObedienceTraining")
+    experience  = a.get("animalOwnerExperience")
+    if training:  parts.append(f"Training: {training}.")
+    if experience and experience not in ("", "None"):
+        parts.append(f"Best for an owner with {experience.lower()} experience.")
 
-    # ── Health & care ─────────────────────────────────────────────────────
+    # Health
     health = []
-    if a.get("isAltered"):              health.append("spayed/neutered")
-    if a.get("isCurrentVaccinations"):  health.append("current on vaccinations")
-    if a.get("isMicrochipped"):         health.append("microchipped")
-    if a.get("isHousetrained"):         health.append("house-trained")
-    if a.get("isSpecialNeeds"):         health.append("has special needs")
-    if health:
-        parts.append(f"{name} is {', '.join(health)}.")
+    if _yes(a.get("animalAltered")) is True:   health.append("spayed/neutered")
+    if _yes(a.get("animalUptodate")) is True:  health.append("up to date on vaccinations")
+    if _yes(a.get("animalHousetrained")) is True: health.append("house-trained")
+    if _yes(a.get("animalSpecialneeds")) is True: health.append("has special needs")
+    if health: parts.append(f"{name} is {', '.join(health)}.")
 
-    # ── Personality traits ─────────────────────────────────────────────────
-    vocal = a.get("vocalLevel")
-    shedding = a.get("sheddingLevel")
-    grooming = a.get("groomingNeeds")
-    coat = a.get("coatLength")
-    personality = []
-    if vocal and vocal != "Some":   personality.append(f"{vocal.lower()} vocal")
-    if shedding:                    personality.append(f"{shedding.lower()} shedding")
-    if grooming:                    personality.append(f"{grooming.lower()} grooming needs")
-    if coat:                        personality.append(f"{coat.lower()} coat")
-    if personality:
-        parts.append(f"Traits: {', '.join(personality)}.")
+    # Traits
+    traits = []
+    vocal    = a.get("animalVocal")
+    shedding = a.get("animalShedding")
+    grooming = a.get("animalGroomingNeeds")
+    coat     = a.get("animalCoatLength")
+    hypo     = _yes(a.get("animalHypoallergenic"))
+    if vocal:    traits.append(f"{vocal.lower()} vocal")
+    if shedding: traits.append(f"{shedding.lower()} shedding")
+    if grooming: traits.append(f"{grooming.lower()} grooming needs")
+    if coat:     traits.append(f"{coat.lower()} coat")
+    if hypo:     traits.append("hypoallergenic")
+    if traits: parts.append(f"Traits: {', '.join(traits)}.")
 
-    # ── Official description (best content) ───────────────────────────────
-    desc = (a.get("descriptionText") or a.get("summary") or "").strip()
-    if desc:
-        parts.append(desc)
+    # Org location context
+    org_name = _s(org.get("orgName"))
+    org_city = _s(org.get("orgCity"))
+    org_state= _s(org.get("orgState"))
+    if org_name: parts.append(f"Available at {org_name}" + (f" in {org_city}, {org_state}." if org_city else "."))
+
+    # Official description
+    desc = _s(a.get("animalDescriptionPlain") or a.get("animalSummary"))
+    if desc: parts.append(desc)
 
     return " ".join(parts)
 
 
 def animal_to_document(a: Dict[str, Any]) -> Optional[Document]:
-    """
-    Convert a RescueGroups animal attributes dict into a LangChain Document.
-    Returns None if the record is missing critical fields.
-    """
-    animal_id = a.get("_id")
-    name = (a.get("name") or "").strip()
-
+    """Convert a raw HTTP/JSON API animal dict into a LangChain Document."""
+    animal_id = a.get("_id") or a.get("animalID")
+    name      = _s(a.get("animalName"))
     if not animal_id or not name:
         return None
 
-    species  = _safe(a.get("_species") or a.get("species"), "Unknown")
-    breed    = _safe(a.get("_breed_primary") or a.get("breedString"), "Mixed")
-    mixed    = a.get("isBreedMixed", False)
+    org     = a.get("_org", {})
+    species = _s(a.get("animalSpecies"))
+    breed   = _s(a.get("animalBreed") or a.get("animalPrimaryBreed"), "Mixed")
+    mixed   = str(a.get("animalMixedBreed", "")).lower() == "yes"
     breed_label = f"{breed} mix" if mixed else breed
 
-    age_group = _safe(a.get("ageGroup"), "Unknown")
-    size      = _safe(a.get("sizeGroup"), "Unknown")
-    sex       = _safe(a.get("sex"), "Unknown")
-    energy    = _safe(a.get("energyLevel"), "Unknown")
+    age     = _s(a.get("animalGeneralAge") or a.get("animalAgeString"))
+    size    = _s(a.get("animalGeneralSizePotential") or a.get("animalSizeCurrent"))
+    sex     = _s(a.get("animalSex"))
+    energy  = _s(a.get("animalEnergyLevel"))
+    activity= _s(a.get("animalActivityLevel"))
 
-    # Location from org
-    org = a.get("_org", {})
-    city     = _safe(org.get("city"), "")
-    state    = _safe(org.get("state"), "")
-    postcode = _safe(org.get("postalcode"), "")
-    org_name = _safe(org.get("name"), "")
-    org_url  = org.get("adoptionUrl") or org.get("url") or ""
+    org_id   = _s(a.get("animalOrgID"))
+    org_name = _s(org.get("orgName"))
+    org_city = _s(org.get("orgCity"))
+    org_state= _s(org.get("orgState"))
+    org_zip  = _s(org.get("orgPostalcode"))
+    org_phone= _s(org.get("orgPhone"))
+    org_email= _s(org.get("orgEmail"))
 
-    # Photo — first picture's "large" URL
-    photos = a.get("_photos", [])
-    photo_url = photos[0].get("large", "") if photos else (
-        a.get("pictureThumbnailUrl") or ""
-    )
+    location_str = _s(a.get("animalLocationCitystate"))
+    city  = org_city or (location_str.split(",")[0].strip() if "," in location_str else "")
+    state = org_state or (location_str.split(",")[1].strip() if "," in location_str else "")
 
-    # Adoption URL
-    adoption_url = a.get("url") or org_url
+    photo_url    = _s(a.get("animalThumbnailUrl"))
+    adoption_url = _s(a.get("animalUrl"))
+    org_url      = _s(org.get("orgUrl") or org.get("orgFacebookUrl"))
 
-    bio = _build_bio(a)
+    bio = _build_bio(a, org)
 
     page_content = (
-        f"Name: {name}. "
-        f"Species: {species}. "
-        f"Breed: {breed_label}. "
-        f"Age group: {age_group}. "
-        f"Size: {size}. "
-        f"Sex: {sex}. "
-        f"Energy level: {energy}. "
-        f"Good with kids: {a.get('isKidsOk')}. "
-        f"Good with dogs: {a.get('isDogsOk')}. "
-        f"Good with cats: {a.get('isCatsOk')}. "
-        f"Requires yard: {a.get('isYardRequired')}. "
-        f"House trained: {a.get('isHousetrained')}. "
-        f"Special needs: {a.get('isSpecialNeeds')}. "
-        f"Activity level: {a.get('activityLevel')}. "
-        f"Exercise needs: {a.get('exerciseNeeds')}. "
-        f"Owner experience needed: {a.get('ownerExperience')}. "
-        f"Location: {city}, {state} {postcode}. "
+        f"Name: {name}. Species: {species}. Breed: {breed_label}. "
+        f"Age: {age}. Size: {size}. Sex: {sex}. "
+        f"Energy level: {energy}. Activity level: {activity}. "
+        f"Good with kids: {a.get('animalOKWithKids')}. "
+        f"Good with dogs: {a.get('animalOKWithDogs')}. "
+        f"Good with cats: {a.get('animalOKWithCats')}. "
+        f"Good with seniors: {a.get('animalOKForSeniors')}. "
+        f"Requires yard: {a.get('animalYardRequired')}. "
+        f"Apartment suitable: {a.get('animalApartment')}. "
+        f"House trained: {a.get('animalHousetrained')}. "
+        f"Special needs: {a.get('animalSpecialneeds')}. "
+        f"Hypoallergenic: {a.get('animalHypoallergenic')}. "
+        f"Owner experience: {a.get('animalOwnerExperience')}. "
+        f"Location: {city}, {state}. "
         f"Shelter: {org_name}. "
         f"Bio: {bio}"
     )
 
     metadata = {
         "rescuegroups_id": str(animal_id),
-        "org_id":          _safe(a.get("_org_id"), ""),
+        "org_id":          org_id,
         "org_name":        org_name,
+        "org_phone":       org_phone,
+        "org_email":       org_email,
+        "org_url":         org_url,
         "name":            name,
         "species":         species,
         "breed":           breed_label,
-        "age_group":       age_group,
+        "age_group":       age,
         "size":            size,
         "sex":             sex,
         "energy_level":    energy,
-        "activity_level":  _safe(a.get("activityLevel"), ""),
-        "good_with_kids":  a.get("isKidsOk"),
-        "good_with_dogs":  a.get("isDogsOk"),
-        "good_with_cats":  a.get("isCatsOk"),
-        "is_seniors_ok":   a.get("isSeniorsOk"),
-        "requires_yard":   a.get("isYardRequired"),
-        "fence_needs":     _safe(a.get("fenceNeeds"), ""),
-        "house_trained":   a.get("isHousetrained"),
-        "is_altered":      a.get("isAltered"),
-        "special_needs":   a.get("isSpecialNeeds"),
-        "shots_current":   a.get("isCurrentVaccinations"),
-        "microchipped":    a.get("isMicrochipped"),
+        "activity_level":  activity,
+        "good_with_kids":  _yes(a.get("animalOKWithKids")),
+        "good_with_dogs":  _yes(a.get("animalOKWithDogs")),
+        "good_with_cats":  _yes(a.get("animalOKWithCats")),
+        "is_seniors_ok":   _yes(a.get("animalOKForSeniors")),
+        "requires_yard":   _yes(a.get("animalYardRequired")),
+        "apartment_ok":    _yes(a.get("animalApartment")),
+        "house_trained":   _yes(a.get("animalHousetrained")),
+        "is_altered":      _yes(a.get("animalAltered")),
+        "special_needs":   _yes(a.get("animalSpecialneeds")),
+        "shots_current":   _yes(a.get("animalUptodate")),
+        "hypoallergenic":  _yes(a.get("animalHypoallergenic")),
+        "needs_foster":    _yes(a.get("animalNeedsFoster")),
         "photo_url":       photo_url,
         "adoption_url":    adoption_url,
         "city":            city,
         "state":           state,
-        "postcode":        postcode,
+        "postcode":        org_zip,
         "status":          "adoptable",
+        "slug":            _s(a.get("animalRescueID")),
     }
 
     return Document(page_content=page_content, metadata=metadata)
 
 
 def animals_to_documents(animals: List[Dict[str, Any]]) -> List[Document]:
-    """Batch-convert raw animal records, skipping invalid ones."""
-    docs = []
-    skipped = 0
+    docs, skipped = [], 0
     for animal in animals:
         doc = animal_to_document(animal)
-        if doc:
-            docs.append(doc)
-        else:
-            skipped += 1
+        if doc: docs.append(doc)
+        else:   skipped += 1
     if skipped:
-        logger.warning("Skipped %s invalid animal records.", skipped)
+        logger.warning("Skipped %d invalid records.", skipped)
     return docs

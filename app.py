@@ -69,11 +69,13 @@ st.markdown("""
 }
 
 .adopt-btn {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     background: #e07b39;
     color: white !important;
     border-radius: 6px;
-    padding: 5px 14px;
+    padding: 7px 14px;
     font-size: 12px;
     font-weight: 500;
     text-decoration: none !important;
@@ -81,10 +83,37 @@ st.markdown("""
 }
 .adopt-btn:hover { background: #c25a1a; }
 
-.shelter-tag {
-    font-size: 11px;
+.no-link-block {
+    background: #f8f6f3;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-top: 10px;
+    border: 0.5px solid #e8e0d8;
+}
+.no-link-title {
+    font-size: 12px;
+    font-weight: 500;
+    color: #888;
+    margin-bottom: 8px;
+}
+.next-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
     color: #666;
-    margin-top: 4px;
+    line-height: 1.5;
+    margin-bottom: 5px;
+}
+.next-step a {
+    color: #185FA5;
+    text-decoration: none;
+}
+.next-step a:hover { text-decoration: underline; }
+.next-step-icon {
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: #aaa;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -124,31 +153,34 @@ def _build_badges(m: dict) -> str:
 
 
 def _meta_line(m: dict) -> str:
-    """One-line summary of key attributes."""
+    """One-line summary — species, age, size, energy, location.
+    Breed is omitted here since it already appears in the card title.
+    """
     parts = []
 
     species = m.get("species", "")
-    if species: parts.append(species)
+    if species and species not in ("Unknown", ""): parts.append(species)
 
-    breed = m.get("breed", "")
-    if breed and breed != "Unknown": parts.append(breed)
-
-    # Age — RescueGroups uses age_group (Baby/Young/Adult/Senior)
-    # Mock data uses age_years (int)
+    # Age — RescueGroups uses age_group string, mock uses age_years int
     age = m.get("age_group") or (
         f"{m['age_years']} yr" if m.get("age_years") else ""
     )
     if age: parts.append(age)
 
+    # Size — guard against numeric 0.0 fallback
     size = m.get("size", "")
-    if size and size != "Unknown": parts.append(size)
+    try:
+        size_valid = size and size not in ("Unknown", "") and float(size) != 0.0
+    except (ValueError, TypeError):
+        size_valid = bool(size and size not in ("Unknown", ""))
+    if size_valid: parts.append(str(size))
 
-    # Energy — RescueGroups uses energy_level string, mock uses same
+    # Energy
     energy = m.get("energy_level", "")
-    if energy and energy != "Unknown": parts.append(f"{energy} energy")
+    if energy and energy not in ("Unknown", ""): parts.append(f"{energy} energy")
 
     # Location
-    city = m.get("city", "")
+    city  = m.get("city", "")
     state = m.get("state", "")
     if city and state: parts.append(f"{city}, {state}")
     elif city:         parts.append(city)
@@ -255,35 +287,74 @@ if run and query.strip():
     st.subheader("📋 Matched Pet Profiles")
 
     for rank, (doc, score) in enumerate(results, start=1):
-        m = doc.metadata
-        badges_html = _build_badges(m)
-        meta_line   = _meta_line(m)
-        score_pct   = f"{score:.0%}"
+        import urllib.parse
 
-        # Photo (RescueGroups only — mock data has no photos)
+        m            = doc.metadata
+        badges_html  = _build_badges(m)
+        meta_line    = _meta_line(m)
+        score_pct    = f"{score:.0%}"
         photo_url    = m.get("photo_url", "")
-        adoption_url = m.get("adoption_url", "")
         org_name     = m.get("org_name", "")
+        city         = m.get("city", "")
+        state        = m.get("state", "")
+        pet_name     = m.get("name", "?")
+        breed        = m.get("breed", "?")
+        location     = ", ".join(filter(None, [city, state]))
+        adoption_url = m.get("adoption_url", "") or m.get("org_url", "")
+        org_phone    = m.get("org_phone", "")
+        org_email    = m.get("org_email", "")
 
-        # Adopt button HTML
-        adopt_html = (
-            f'<a class="adopt-btn" href="{adoption_url}" target="_blank">🐾 View on RescueGroups</a>'
-            if adoption_url else ""
-        )
+        # ── Build action block based on what data we have ─────────────────
+        if adoption_url:
+            # State 1 — direct link available
+            action_html = f'<div style="margin-top:10px"><a class="adopt-btn" href="{adoption_url}" target="_blank">&#128062; View on RescueGroups</a></div>'
 
-        # Shelter tag
-        shelter_html = (
-            f'<div class="shelter-tag">🏠 {org_name}</div>'
-            if org_name else ""
-        )
+        else:
+            # States 2 & 3 — no direct link, build contextual next steps
+            steps = []
+
+            if org_name:
+                steps.append(
+                    f'<div class="next-step"><span class="next-step-icon">&#128222;</span>'
+                    f'<span>Call or visit <strong>{org_name}</strong> and ask about {pet_name}'
+                    + (f' &mdash; <a href="tel:{org_phone}">{org_phone}</a>' if m.get("org_phone") else "")
+                    + '</span></div>'
+                )
+
+            google_q   = " ".join(filter(None, [pet_name, breed, org_name or location, "adopt"]))
+            google_url = f"https://www.google.com/search?q={urllib.parse.quote(google_q)}"
+            steps.append(
+                f'<div class="next-step"><span class="next-step-icon">&#128269;</span>'
+                f'<span><a href="{google_url}" target="_blank">Search for {pet_name} on Google</a></span></div>'
+            )
+
+            rg_location = urllib.parse.quote(m.get("postcode") or "08817")
+            rg_species  = (m.get("species") or "cat").lower()
+            rg_url      = f"https://rescuegroups.org/adopt/?postalcode={rg_location}&miles=25"
+            steps.append(
+                f'<div class="next-step"><span class="next-step-icon">&#128196;</span>'
+                f'<span><a href="{rg_url}" target="_blank">Browse adoptable pets near {location or "Edison, NJ"} on RescueGroups</a></span></div>'
+            )
+
+            if not org_name:
+                steps.append(
+                    f'<div class="next-step"><span class="next-step-icon">&#128172;</span>'
+                    f'<span>Ask a local shelter if they have a {breed} or similar available</span></div>'
+                )
+
+            action_html = (
+                f'<div class="no-link-block">'
+                f'<div class="no-link-title">No direct listing &mdash; how to adopt {pet_name}</div>'
+                + "".join(steps)
+                + '</div>'
+            )
 
         card_html = f"""
         <div class="match-card">
-          <h4>#{rank} · {m.get('name', '?')} — {m.get('breed', '?')}</h4>
-          <div class="meta">{meta_line} · Match: {score_pct}</div>
+          <h4>#{rank} &middot; {pet_name} &mdash; {breed}</h4>
+          <div class="meta">{meta_line} &middot; Match: {score_pct}</div>
           {badges_html}
-          {shelter_html}
-          {adopt_html}
+          {action_html}
         </div>
         """
 
@@ -298,7 +369,7 @@ if run and query.strip():
             st.markdown(card_html, unsafe_allow_html=True)
 
         # Full bio expander
-        with st.expander(f"Read {m.get('name', 'their')} full bio"):
+        with st.expander(f"Read {pet_name}'s full bio"):
             bio_start = doc.page_content.find("Bio: ")
             bio = doc.page_content[bio_start + 5:] if bio_start != -1 else doc.page_content
             st.write(bio)

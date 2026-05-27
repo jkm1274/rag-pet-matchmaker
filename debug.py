@@ -211,30 +211,29 @@ else:
         ok = client.test_connection()
         if ok:
             print(f"{PASS}  RescueGroups API key is valid")
-
-            # Fetch one page of real animals as a smoke test
             print(f"{INFO}  Fetching first 5 animals near Edison NJ (08817)...")
             count = 0
             for animal in client.fetch_animals_by_location(
                 postal_code="08817", distance_miles=25, limit=5, max_pages=1
             ):
-                name    = animal.get("name", "?")
-                species = animal.get("_species", "?")
-                city    = animal.get("_org", {}).get("city", "?")
-                print(f"       • {name:15} | {species:6} | {city}")
+                name     = animal.get("animalName", "?")
+                species  = animal.get("animalSpecies", "?")
+                org      = animal.get("_org", {})
+                org_name = org.get("orgName", "—")
+                org_city = org.get("orgCity", "—")
+                org_phone= org.get("orgPhone", "—")
+                print(f"       • {name:15} | {species:6} | {org_name} ({org_city}) {org_phone}")
                 count += 1
                 if count >= 5:
                     break
 
             if count > 0:
-                print(f"\n{PASS}  Fetched {count} real animals from RescueGroups")
+                print(f"\n{PASS}  Fetched {count} real animals with org data")
                 print(f"       Ready to run: python -m src.ingestion.sync")
             else:
-                print(f"⚠️   No animals returned — check your ZIP code and distance settings")
-
+                print(f"⚠️   No animals returned — check ZIP code and distance settings")
         else:
             print(f"{FAIL}  RescueGroups API key invalid or connection failed")
-            print("       Double-check the key in your .env file")
 
     except Exception as e:
         print(f"{FAIL}  RescueGroups test failed: {e}")

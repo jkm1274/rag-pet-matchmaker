@@ -1,18 +1,17 @@
 """
 src/ingestion/rescuegroups_client.py
 
-RescueGroups.org v5 API client.
-Handles auth, pagination, and radius-based animal search.
+RescueGroups HTTP/JSON API (v2) client.
 
-API docs: https://test1-api.rescuegroups.org/v5/public/docs
-Base URL:  https://api.rescuegroups.org/v5
-
-Key differences from Petfinder:
-  - Auth is a simple API key header (no OAuth)
-  - Search uses POST with a JSON body (not GET query params)
-  - Radius search uses a filterRadius object in the POST body
-  - Response follows JSON:API spec: data under data[].attributes,
-    photos under included[], org info under included[]
+Key facts:
+  - Single endpoint: POST https://api.rescuegroups.org/http/v2.json
+  - API key goes in the request body (not a header)
+  - All requests are POST with JSON body
+  - Two-step approach for org data:
+      1. Search animals → collect animalOrgID values
+      2. Batch lookup orgs by ID → merge into animal records
+  - location fields (locationName etc.) are empty on animal records;
+    org data must be fetched separately via objectType: orgs
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Set
 
 import requests
 from dotenv import load_dotenv
@@ -29,12 +28,45 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://api.rescuegroups.org/v5"
-REQUEST_DELAY = 1.0  # seconds between paginated requests
+API_URL      = "https://api.rescuegroups.org/http/v2.json"
+REQUEST_DELAY = 0.5  # seconds between requests
+
+# All valid animal fields we want
+ANIMAL_FIELDS = [
+    "animalID", "animalOrgID", "animalName",
+    "animalSpecies", "animalBreed", "animalPrimaryBreed",
+    "animalSecondaryBreed", "animalMixedBreed",
+    "animalGeneralAge", "animalAgeString", "animalBirthdate",
+    "animalSex", "animalGeneralSizePotential", "animalSizeCurrent",
+    "animalEnergyLevel", "animalActivityLevel", "animalExerciseNeeds",
+    "animalDescriptionPlain", "animalSummary",
+    "animalThumbnailUrl", "animalUrl",
+    # Compatibility
+    "animalOKWithKids", "animalOKWithDogs", "animalOKWithCats",
+    "animalOKForSeniors", "animalYardRequired", "animalApartment",
+    "animalHousetrained", "animalAltered", "animalUptodate",
+    "animalSpecialneeds", "animalSpecialneedsDescription",
+    "animalHypoallergenic", "animalDeclawed",
+    "animalObedienceTraining", "animalOwnerExperience",
+    "animalIndoorOutdoor", "animalFence",
+    "animalNeedsFoster", "animalCourtesy",
+    # Health / traits
+    "animalShedding", "animalGroomingNeeds", "animalCoatLength",
+    "animalVocal", "animalNewPeople",
+    # Location
+    "animalLocationCitystate", "animalLocationDistance",
+    "animalLocationState",
+]
+
+# Valid org fields (confirmed from API define)
+ORG_FIELDS = [
+    "orgID", "orgName", "orgCity", "orgState",
+    "orgPostalcode", "orgPhone", "orgEmail", "orgFacebookUrl",
+]
 
 
 class RescueGroupsClient:
-    """Thin wrapper around the RescueGroups v5 REST API."""
+    """HTTP/JSON API v2 client for RescueGroups.org."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.api_key = api_key or os.environ.get("RESCUEGROUPS_API_KEY", "")
@@ -43,36 +75,56 @@ class RescueGroupsClient:
                 "RescueGroups API key not found. "
                 "Set RESCUEGROUPS_API_KEY in your .env file."
             )
+        self._org_cache: Dict[str, Dict] = {}
 
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Content-Type": "application/vnd.api+json",
-            "Authorization": self.api_key,
-        }
-
-    def _post(self, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Make a POST request and return the JSON response."""
+    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST to the API and return the JSON response."""
         time.sleep(REQUEST_DELAY)
-        url = f"{BASE_URL}{endpoint}"
-        resp = requests.post(url, headers=self._headers(), json=body, timeout=15)
-
-        if resp.status_code == 429:
-            logger.warning("Rate limited — waiting 30s before retry")
-            time.sleep(30)
-            resp = requests.post(url, headers=self._headers(), json=body, timeout=15)
-
+        resp = requests.post(
+            API_URL,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
         resp.raise_for_status()
         return resp.json()
 
-    def _get(self, endpoint: str) -> Dict[str, Any]:
-        """Make a GET request and return the JSON response."""
-        time.sleep(REQUEST_DELAY)
-        url = f"{BASE_URL}{endpoint}"
-        resp = requests.get(url, headers=self._headers(), timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+    def _fetch_orgs(self, org_ids: List[str]) -> Dict[str, Dict]:
+        """Batch fetch org details for a list of org IDs.
+        Results are cached so each org is only fetched once per sync.
+        """
+        uncached = [oid for oid in org_ids if oid not in self._org_cache]
 
-    # ── Public API ────────────────────────────────────────────────────────────
+        if not uncached:
+            return {oid: self._org_cache[oid] for oid in org_ids}
+
+        # Fetch in batches of 50 to avoid overly large requests
+        batch_size = 50
+        for i in range(0, len(uncached), batch_size):
+            batch = uncached[i:i + batch_size]
+            data = self._post({
+                "apikey": self.api_key,
+                "objectType": "orgs",
+                "objectAction": "publicSearch",
+                "search": {
+                    "calcFoundRows": "No",
+                    "resultStart": 0,
+                    "resultLimit": batch_size,
+                    "fields": ORG_FIELDS,
+                    "filters": [
+                        {"fieldName": "orgID", "operation": "equals", "criteria": batch},
+                    ],
+                },
+            })
+
+            orgs = data.get("data", {})
+            for org_id, attrs in orgs.items():
+                self._org_cache[org_id] = attrs
+                logger.debug("Cached org %s: %s", org_id, attrs.get("orgName"))
+
+            logger.info("Fetched %d orgs (batch %d)", len(orgs), i // batch_size + 1)
+
+        return {oid: self._org_cache.get(oid, {}) for oid in org_ids}
 
     def fetch_animals_by_location(
         self,
@@ -82,149 +134,89 @@ class RescueGroupsClient:
         max_pages: Optional[int] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        Yield individual animal records near a postal code.
+        Yield animal dicts enriched with org data, near a postal code.
 
-        Uses the RescueGroups v5 radius search (POST to search/available)
-        with pictures and org info included in each response.
-
-        Args:
-            postal_code:    US ZIP code, e.g. "08817" for Edison NJ
-            distance_miles: Search radius in miles
-            limit:          Animals per page (max 250)
-            max_pages:      Safety cap on pages. None = fetch all.
+        Uses pagination via resultStart. For each page:
+          1. Fetches animals with location filter
+          2. Batch-fetches org data for unique orgIDs on that page
+          3. Merges org data into each animal record
+          4. Yields each enriched animal dict
         """
-        page = 1
-        total_pages = None
+        result_start = 0
+        total_found  = None
+        page         = 0
 
         while True:
-            body = {
-                "data": {
-                    "filterRadius": {
-                        "postalcode": postal_code,
-                        "miles": distance_miles,
-                    }
-                },
-            }
-
-            endpoint = (
-                f"/public/animals/search/available/"
-                f"?limit={limit}&page={page}"
-                f"&include[]=pictures&include[]=orgs&include[]=breeds&include[]=species"
-                f"&sort=distance"
-            )
-
+            page += 1
             logger.info(
-                "Fetching RescueGroups page %s (ZIP=%s, radius=%s mi)",
-                page, postal_code, distance_miles,
+                "Fetching HTTP/JSON page %d (start=%d, ZIP=%s, radius=%d mi)",
+                page, result_start, postal_code, distance_miles,
             )
 
-            data = self._post(endpoint, body)
-            animals: List[Dict[str, Any]] = data.get("data", [])
-            included: List[Dict[str, Any]] = data.get("included", [])
-            meta: Dict[str, Any] = data.get("meta", {})
+            data = self._post({
+                "apikey": self.api_key,
+                "objectType": "animals",
+                "objectAction": "publicSearch",
+                "search": {
+                    "calcFoundRows": "Yes",
+                    "resultStart": result_start,
+                    "resultLimit": limit,
+                    "fields": ANIMAL_FIELDS,
+                    "filters": [
+                        {"fieldName": "animalStatus",
+                         "operation": "equals",   "criteria": "Available"},
+                        {"fieldName": "animalLocation",
+                         "operation": "equals",   "criteria": postal_code},
+                        {"fieldName": "animalLocationDistance",
+                         "operation": "radius",   "criteria": str(distance_miles)},
+                    ],
+                },
+            })
 
-            if total_pages is None:
-                total_pages = meta.get("pages", 1)
-                logger.info(
-                    "Total animals: %s across %s pages",
-                    meta.get("count", "?"),
-                    total_pages,
-                )
+            status  = data.get("status")
+            animals = data.get("data", {})
 
-            # Build lookup maps for included data
-            pictures_by_animal: Dict[str, List[Dict]] = {}
-            orgs_by_id: Dict[str, Dict] = {}
-            breeds_by_id: Dict[str, str] = {}
-            species_by_id: Dict[str, str] = {}
+            if total_found is None:
+                total_found = int(data.get("foundRows", 0))
+                logger.info("Total animals: %d", total_found)
 
-            for item in included:
-                item_type = item.get("type")
-                item_id = item.get("id")
-                attrs = item.get("attributes", {})
+            if status == "error" or not animals:
+                logger.warning("No animals on page %d (status=%s)", page, status)
+                break
 
-                if item_type == "pictures":
-                    # Pictures link back to their animal via relationships
-                    animal_rel = (
-                        item.get("relationships", {})
-                        .get("animals", {})
-                        .get("data", {})
-                    )
-                    if isinstance(animal_rel, dict):
-                        aid = animal_rel.get("id")
-                        if aid:
-                            pictures_by_animal.setdefault(aid, []).append(attrs)
+            # ── Batch fetch org data for this page ─────────────────────────
+            org_ids = list({
+                a.get("animalOrgID")
+                for a in animals.values()
+                if a.get("animalOrgID")
+            })
+            if org_ids:
+                self._fetch_orgs(org_ids)
 
-                elif item_type == "orgs":
-                    orgs_by_id[item_id] = attrs
-
-                elif item_type == "breeds":
-                    breeds_by_id[item_id] = attrs.get("name", "")
-
-                elif item_type == "species":
-                    species_by_id[item_id] = attrs.get("singular", "")
-
-            # Attach included data to each animal and yield
-            for animal in animals:
-                animal_id = animal.get("id")
-                attrs = animal.get("attributes", {})
-                relationships = animal.get("relationships", {})
-
-                # Attach photos
-                attrs["_photos"] = pictures_by_animal.get(animal_id, [])
-
-                # Attach org info
-                org_rel = relationships.get("orgs", {}).get("data", {})
-                if isinstance(org_rel, dict):
-                    org_id = org_rel.get("id")
-                    attrs["_org"] = orgs_by_id.get(org_id, {})
-                    attrs["_org_id"] = org_id
-                elif isinstance(org_rel, list) and org_rel:
-                    org_id = org_rel[0].get("id")
-                    attrs["_org"] = orgs_by_id.get(org_id, {})
-                    attrs["_org_id"] = org_id
-                else:
-                    attrs["_org"] = {}
-                    attrs["_org_id"] = ""
-
-                # Attach primary breed name
-                breed_rel = relationships.get("breeds", {}).get("data", [])
-                if isinstance(breed_rel, list) and breed_rel:
-                    attrs["_breed_primary"] = breeds_by_id.get(
-                        breed_rel[0].get("id", ""), ""
-                    )
-                    if len(breed_rel) > 1:
-                        attrs["_breed_secondary"] = breeds_by_id.get(
-                            breed_rel[1].get("id", ""), ""
-                        )
-                else:
-                    attrs["_breed_primary"] = attrs.get("breedPrimary", "")
-                    attrs["_breed_secondary"] = attrs.get("breedSecondary", "")
-
-                # Attach species name
-                species_rel = relationships.get("species", {}).get("data", {})
-                if isinstance(species_rel, dict):
-                    attrs["_species"] = species_by_id.get(
-                        species_rel.get("id", ""), ""
-                    )
-                else:
-                    attrs["_species"] = ""
-
-                attrs["_id"] = animal_id
+            # ── Yield each animal enriched with org data ───────────────────
+            for animal_id, attrs in animals.items():
+                attrs["_id"]  = animal_id
+                org_id        = attrs.get("animalOrgID", "")
+                attrs["_org"] = self._org_cache.get(org_id, {})
                 yield attrs
 
-            if page >= total_pages:
+            result_start += limit
+
+            if result_start >= total_found:
                 break
             if max_pages and page >= max_pages:
-                logger.info("Reached max_pages limit (%s), stopping.", max_pages)
+                logger.info("Reached max_pages limit (%d), stopping.", max_pages)
                 break
 
-            page += 1
-
     def test_connection(self) -> bool:
-        """Quick check that the API key is valid. Returns True if OK."""
+        """Quick check that the API key is valid."""
         try:
-            data = self._get("/public/animals/species/")
-            return "data" in data
+            data = self._post({
+                "apikey": self.api_key,
+                "objectType": "animals",
+                "objectAction": "define",
+            })
+            return data.get("status") == "ok"
         except Exception as e:
-            logger.error("RescueGroups connection test failed: %s", e)
+            logger.error("Connection test failed: %s", e)
             return False
