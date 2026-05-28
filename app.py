@@ -300,9 +300,26 @@ if run and query.strip():
         pet_name     = m.get("name", "?")
         breed        = m.get("breed", "?")
         location     = ", ".join(filter(None, [city, state]))
-        adoption_url = m.get("adoption_url", "") or m.get("org_url", "")
+        # Only use adoption_url if it looks like an actual animal listing
+        # Don't fall through to org_url here — that's handled in the action block
+        adoption_url = m.get("adoption_url", "")
         org_phone    = m.get("org_phone", "")
         org_email    = m.get("org_email", "")
+
+        # Validate adoption URL:
+        # 1. Must be a rescuegroups.org URL to count as a direct listing
+        # 2. If AnimalID= matches org_id, reconstruct with correct animal ID
+        from urllib.parse import urlparse
+        if adoption_url:
+            if "rescuegroups.org" not in adoption_url:
+                adoption_url = ""  # not a valid listing URL
+            elif "AnimalID=" in adoption_url:
+                url_animal_id = adoption_url.split("AnimalID=")[-1].strip()
+                org_id        = m.get("org_id", "")
+                rg_id         = m.get("rescuegroups_id", "")
+                if url_animal_id == org_id and url_animal_id != rg_id and rg_id:
+                    parsed       = urlparse(adoption_url)
+                    adoption_url = f"{parsed.scheme}://{parsed.netloc}/animals/detail?AnimalID={rg_id}"
 
         # ── Build action block based on what data we have ─────────────────
         if adoption_url:
@@ -319,6 +336,19 @@ if run and query.strip():
                     f'<span>Call or visit <strong>{org_name}</strong> and ask about {pet_name}'
                     + (f' &mdash; <a href="tel:{org_phone}">{org_phone}</a>' if m.get("org_phone") else "")
                     + '</span></div>'
+                )
+
+            # Facebook / org website as a direct link if available
+            org_fb = m.get("org_url", "")
+            if org_fb and "facebook.com" in org_fb:
+                steps.append(
+                    f'<div class="next-step"><span class="next-step-icon">&#128279;</span>'
+                    f'<span><a href="{org_fb}" target="_blank">Find {org_name or "this shelter"} on Facebook</a></span></div>'
+                )
+            elif org_fb:
+                steps.append(
+                    f'<div class="next-step"><span class="next-step-icon">&#127968;</span>'
+                    f'<span><a href="{org_fb}" target="_blank">Visit {org_name or "shelter"} website</a></span></div>'
                 )
 
             google_q   = " ".join(filter(None, [pet_name, breed, org_name or location, "adopt"]))
