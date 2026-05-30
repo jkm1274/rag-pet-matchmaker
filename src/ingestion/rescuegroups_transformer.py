@@ -160,23 +160,50 @@ def animal_to_document(a: Dict[str, Any]) -> Optional[Document]:
 
     bio = _build_bio(a, org)
 
+    # ── Build embedding content ───────────────────────────────────────────────
+    # Key structured fields are repeated to boost their weight in the embedding
+    # relative to the longer bio text. This is a standard RAG technique for
+    # structured data where specific attributes (energy, apartment suitability)
+    # should match as strongly as narrative descriptions.
+
+    # Human-readable compatibility summary for better semantic matching
+    compat_parts = []
+    if _yes(a.get("animalOKWithKids")) is True:    compat_parts.append("good with children")
+    if _yes(a.get("animalOKWithKids")) is False:   compat_parts.append("not good with children")
+    if _yes(a.get("animalOKWithDogs")) is True:    compat_parts.append("good with other dogs")
+    if _yes(a.get("animalOKWithDogs")) is False:   compat_parts.append("not good with other dogs")
+    if _yes(a.get("animalOKWithCats")) is True:    compat_parts.append("good with cats")
+    if _yes(a.get("animalOKWithCats")) is False:   compat_parts.append("not good with cats")
+    if _yes(a.get("animalYardRequired")) is True:  compat_parts.append("requires a yard")
+    if _yes(a.get("animalYardRequired")) is False: compat_parts.append("suitable for apartment living")
+    if _yes(a.get("animalApartment")) is True:     compat_parts.append("apartment friendly")
+    if _yes(a.get("animalHypoallergenic")) is True:compat_parts.append("hypoallergenic")
+    compat_str = ", ".join(compat_parts) if compat_parts else ""
+
     page_content = (
-        f"Name: {name}. Species: {species}. Breed: {breed_label}. "
-        f"Age: {age}. Size: {size}. Sex: {sex}. "
-        f"Energy level: {energy}. Activity level: {activity}. "
-        f"Good with kids: {a.get('animalOKWithKids')}. "
-        f"Good with dogs: {a.get('animalOKWithDogs')}. "
-        f"Good with cats: {a.get('animalOKWithCats')}. "
-        f"Good with seniors: {a.get('animalOKForSeniors')}. "
-        f"Requires yard: {a.get('animalYardRequired')}. "
-        f"Apartment suitable: {a.get('animalApartment')}. "
-        f"House trained: {a.get('animalHousetrained')}. "
-        f"Special needs: {a.get('animalSpecialneeds')}. "
-        f"Hypoallergenic: {a.get('animalHypoallergenic')}. "
-        f"Owner experience: {a.get('animalOwnerExperience')}. "
-        f"Location: {city}, {state}. "
-        f"Shelter: {org_name}. "
-        f"Bio: {bio}"
+        # ── Core identity (repeated for weight) ───────────────────────────
+        f"Species: {species}. Breed: {breed_label}. Age: {age}. Size: {size}. "
+        f"Energy level: {energy}. "
+
+        # ── Repeat high-signal fields so they dominate the embedding ──────
+        + (f"This is a {energy.lower()} energy {species.lower()}. " if energy and energy != "Unknown" else "")
+        + (f"Breed: {breed_label}. " if breed_label and breed_label != "Mixed" else "")
+        + (f"Age group: {age}. " if age else "")
+        + (f"Size: {size}. " if size and size != "Unknown" else "")
+
+        # ── Compatibility in natural language ─────────────────────────────
+        + (f"This {species.lower()} is {compat_str}. " if compat_str else "")
+
+        # ── Additional structured fields ──────────────────────────────────
+        + f"Activity level: {activity}. "
+        + f"House trained: {a.get('animalHousetrained')}. "
+        + f"Special needs: {a.get('animalSpecialneeds')}. "
+        + f"Owner experience needed: {a.get('animalOwnerExperience')}. "
+        + f"Location: {city}, {state}. "
+        + f"Name: {name}. "
+
+        # ── Bio last — provides narrative context ─────────────────────────
+        + f"Bio: {bio}"
     )
 
     metadata = {

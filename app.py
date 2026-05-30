@@ -5,15 +5,22 @@ Run:  streamlit run app.py
 
 from __future__ import annotations
 
+import io
+import json
 import os
+import urllib.parse
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-load_dotenv()  # must be before any langchain/openai imports
+load_dotenv()
 
 import streamlit as st
 from langchain_chroma import Chroma
 
 from src.ingestion.ingest import build_vector_store, load_pet_documents, load_vector_store
+from src.utils.location import (
+    filter_postcodes_by_radius, get_zip_coords, NJ_ZIP_SUGGESTIONS
+)
 from src.retrieval.retriever import format_context, retrieve_pets
 from src.llm.chain import generate_recommendation
 
@@ -24,6 +31,23 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="expanded",
 )
+
+# ── Session state init ─────────────────────────────────────────────────────────
+if "favorites" not in st.session_state:
+    st.session_state["favorites"] = {}
+if "results" not in st.session_state:
+    st.session_state["results"] = None
+if "recommendation" not in st.session_state:
+    st.session_state["recommendation"] = None
+if "last_search_zip" not in st.session_state:
+    st.session_state["last_search_zip"] = None
+if "last_radius" not in st.session_state:
+    st.session_state["last_radius"] = None
+if "show_more" not in st.session_state:
+    st.session_state["show_more"] = False
+if "all_results" not in st.session_state:
+    st.session_state["all_results"] = None
+
 
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -49,14 +73,8 @@ st.markdown("""
     padding: 2px 9px;
     margin: 2px;
 }
-.badge-green {
-    background: #e6f4ea;
-    color: #2d6a4f;
-}
-.badge-gray {
-    background: #f0f0f0;
-    color: #666;
-}
+.badge-green { background: #e6f4ea; color: #2d6a4f; }
+.badge-gray  { background: #f0f0f0; color: #666; }
 
 .rec-box {
     background: #f0f7ff;
@@ -105,16 +123,9 @@ st.markdown("""
     line-height: 1.5;
     margin-bottom: 5px;
 }
-.next-step a {
-    color: #185FA5;
-    text-decoration: none;
-}
+.next-step a { color: #185FA5; text-decoration: none; }
 .next-step a:hover { text-decoration: underline; }
-.next-step-icon {
-    flex-shrink: 0;
-    margin-top: 1px;
-    color: #aaa;
-}
+.next-step-icon { flex-shrink: 0; margin-top: 1px; color: #aaa; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -122,78 +133,193 @@ st.markdown("""
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _badge(text: str, style: str = "") -> str:
-    cls = f"badge {style}".strip()
-    return f'<span class="{cls}">{text}</span>'
+    return f'<span class="badge {style}".strip()>{text}</span>'
 
 
 def _build_badges(m: dict) -> str:
-    """Build badge HTML from metadata — works for both mock and RescueGroups data."""
     badges = []
-
-    # Compatibility
-    if m.get("good_with_kids") is True:   badges.append(_badge("👶 Kids OK", "badge-green"))
-    if m.get("good_with_dogs") is True:   badges.append(_badge("🐕 Dogs OK", "badge-green"))
-    if m.get("good_with_cats") is True:   badges.append(_badge("🐈 Cats OK", "badge-green"))
-    if m.get("is_seniors_ok") is True:    badges.append(_badge("👴 Seniors OK", "badge-green"))
-
-    # Living situation
-    requires_yard = m.get("requires_yard") or m.get("requires_yard")
-    if requires_yard is False:            badges.append(_badge("🏢 Apartment OK", "badge-green"))
-    if requires_yard is True:             badges.append(_badge("🏡 Needs yard", "badge-gray"))
-
-    # Health
-    if m.get("hypoallergenic"):           badges.append(_badge("🌿 Hypoallergenic", "badge-green"))
-    if m.get("house_trained") or m.get("is_altered") is False:
-        pass  # don't show negative health badges
-    if m.get("is_altered") is True:       badges.append(_badge("✂️ Altered", "badge-gray"))
-    if m.get("shots_current") is True:    badges.append(_badge("💉 Vaccinated", "badge-gray"))
-    if m.get("special_needs") is True:    badges.append(_badge("💊 Special needs", "badge-gray"))
-
+    if m.get("good_with_kids") is True:  badges.append(_badge("👶 Kids OK", "badge-green"))
+    if m.get("good_with_dogs") is True:  badges.append(_badge("🐕 Dogs OK", "badge-green"))
+    if m.get("good_with_cats") is True:  badges.append(_badge("🐈 Cats OK", "badge-green"))
+    if m.get("is_seniors_ok") is True:   badges.append(_badge("👴 Seniors OK", "badge-green"))
+    requires_yard = m.get("requires_yard")
+    if requires_yard is False:           badges.append(_badge("🏢 Apartment OK", "badge-green"))
+    if requires_yard is True:            badges.append(_badge("🏡 Needs yard", "badge-gray"))
+    if m.get("hypoallergenic"):          badges.append(_badge("🌿 Hypoallergenic", "badge-green"))
+    if m.get("is_altered") is True:      badges.append(_badge("✂️ Altered", "badge-gray"))
+    if m.get("shots_current") is True:   badges.append(_badge("💉 Vaccinated", "badge-gray"))
+    if m.get("special_needs") is True:   badges.append(_badge("💊 Special needs", "badge-gray"))
     return " ".join(badges)
 
 
 def _meta_line(m: dict) -> str:
-    """One-line summary — species, age, size, energy, location.
-    Breed is omitted here since it already appears in the card title.
-    """
     parts = []
-
     species = m.get("species", "")
     if species and species not in ("Unknown", ""): parts.append(species)
-
-    # Age — RescueGroups uses age_group string, mock uses age_years int
-    age = m.get("age_group") or (
-        f"{m['age_years']} yr" if m.get("age_years") else ""
-    )
+    age = m.get("age_group") or (f"{m['age_years']} yr" if m.get("age_years") else "")
     if age: parts.append(age)
-
-    # Size — guard against numeric 0.0 fallback
     size = m.get("size", "")
     try:
         size_valid = size and size not in ("Unknown", "") and float(size) != 0.0
     except (ValueError, TypeError):
         size_valid = bool(size and size not in ("Unknown", ""))
     if size_valid: parts.append(str(size))
-
-    # Energy
     energy = m.get("energy_level", "")
     if energy and energy not in ("Unknown", ""): parts.append(f"{energy} energy")
-
-    # Location
-    city  = m.get("city", "")
-    state = m.get("state", "")
+    city, state = m.get("city", ""), m.get("state", "")
     if city and state: parts.append(f"{city}, {state}")
     elif city:         parts.append(city)
-
     return " · ".join(parts)
 
 
-# ── Vector store (cached across reruns) ───────────────────────────────────────
+def _validate_adoption_url(m: dict) -> str:
+    """Return a valid RescueGroups adoption URL, reconstructing if misconfigured."""
+    url = m.get("adoption_url", "")
+    if not url:
+        return ""
+    if "rescuegroups.org" not in url:
+        return ""
+    if "AnimalID=" in url:
+        url_animal_id = url.split("AnimalID=")[-1].strip()
+        org_id = m.get("org_id", "")
+        rg_id  = m.get("rescuegroups_id", "")
+        if url_animal_id == org_id and url_animal_id != rg_id and rg_id:
+            parsed = urlparse(url)
+            return f"{parsed.scheme}://{parsed.netloc}/animals/detail?AnimalID={rg_id}"
+    return url
+
+
+def _build_action_html(m: dict, adoption_url: str) -> str:
+    """Build the action block HTML for a pet card."""
+    if adoption_url:
+        return (
+            f'<div style="margin-top:10px">'
+            f'<a class="adopt-btn" href="{adoption_url}" target="_blank">'
+            f'&#128062; View on RescueGroups</a></div>'
+        )
+
+    pet_name = m.get("name", "?")
+    breed    = m.get("breed", "?")
+    org_name = m.get("org_name", "")
+    org_phone= m.get("org_phone", "")
+    org_fb   = m.get("org_url", "")
+    city     = m.get("city", "")
+    state    = m.get("state", "")
+    location = ", ".join(filter(None, [city, state]))
+    postcode = m.get("postcode") or "08817"
+
+    steps = []
+
+    if org_name:
+        phone_html = (
+            f' &mdash; <a href="tel:{org_phone}">{org_phone}</a>'
+            if org_phone else ""
+        )
+        steps.append(
+            f'<div class="next-step"><span class="next-step-icon">&#128222;</span>'
+            f'<span>Call or visit <strong>{org_name}</strong> and ask about {pet_name}'
+            f'{phone_html}</span></div>'
+        )
+
+    if org_fb and "facebook.com" in org_fb:
+        steps.append(
+            f'<div class="next-step"><span class="next-step-icon">&#128279;</span>'
+            f'<span><a href="{org_fb}" target="_blank">'
+            f'Find {org_name or "this shelter"} on Facebook</a></span></div>'
+        )
+    elif org_fb:
+        steps.append(
+            f'<div class="next-step"><span class="next-step-icon">&#127968;</span>'
+            f'<span><a href="{org_fb}" target="_blank">'
+            f'Visit {org_name or "shelter"} website</a></span></div>'
+        )
+
+    google_q   = " ".join(filter(None, [pet_name, breed, org_name or location, "adopt"]))
+    google_url = f"https://www.google.com/search?q={urllib.parse.quote(google_q)}"
+    steps.append(
+        f'<div class="next-step"><span class="next-step-icon">&#128269;</span>'
+        f'<span><a href="{google_url}" target="_blank">Search for {pet_name} on Google</a></span></div>'
+    )
+
+    rg_url = f"https://rescuegroups.org/adopt/?postalcode={urllib.parse.quote(postcode)}&miles=25"
+    steps.append(
+        f'<div class="next-step"><span class="next-step-icon">&#128196;</span>'
+        f'<span><a href="{rg_url}" target="_blank">'
+        f'Browse adoptable pets near {location or "Edison, NJ"} on RescueGroups</a></span></div>'
+    )
+
+    if not org_name:
+        steps.append(
+            f'<div class="next-step"><span class="next-step-icon">&#128172;</span>'
+            f'<span>Ask a local shelter if they have a {breed} or similar available</span></div>'
+        )
+
+    return (
+        f'<div class="no-link-block">'
+        f'<div class="no-link-title">No direct listing &mdash; how to adopt {pet_name}</div>'
+        + "".join(steps)
+        + '</div>'
+    )
+
+
+# ── Favorites helpers ──────────────────────────────────────────────────────────
+
+def _favorite_key(m: dict) -> str:
+    return m.get("rescuegroups_id") or m.get("name", "unknown")
+
+
+def _toggle_favorite(key: str, m: dict) -> None:
+    if key in st.session_state["favorites"]:
+        del st.session_state["favorites"][key]
+    else:
+        st.session_state["favorites"][key] = m
+
+
+def _build_favorites_csv() -> str:
+    """Generate a CSV string from saved favorites."""
+    favs = list(st.session_state["favorites"].values())
+    if not favs:
+        return ""
+    cols = ["name", "species", "breed", "age_group", "size", "energy_level",
+            "city", "state", "org_name", "org_phone", "org_email",
+            "adoption_url", "photo_url", "good_with_kids", "good_with_dogs",
+            "good_with_cats", "requires_yard", "special_needs"]
+    lines = [",".join(cols)]
+    for m in favs:
+        row = [str(m.get(c, "")).replace(",", ";").replace("\n", " ") for c in cols]
+        lines.append(",".join(row))
+    return "\n".join(lines)
+
+
+def _build_favorites_text() -> str:
+    """Generate a readable text summary of saved favorites."""
+    favs = list(st.session_state["favorites"].values())
+    if not favs:
+        return ""
+    lines = ["🐾 PawMatch — My Saved Pets\n" + "=" * 40]
+    for i, m in enumerate(favs, 1):
+        name     = m.get("name", "?")
+        breed    = m.get("breed", "?")
+        species  = m.get("species", "?")
+        age      = m.get("age_group", "?")
+        location = ", ".join(filter(None, [m.get("city"), m.get("state")]))
+        org      = m.get("org_name", "")
+        phone    = m.get("org_phone", "")
+        url      = _validate_adoption_url(m) or m.get("org_url", "")
+
+        lines.append(f"\n{i}. {name} — {breed}")
+        lines.append(f"   {species} · {age} · {location}")
+        if org:   lines.append(f"   Shelter: {org}")
+        if phone: lines.append(f"   Phone:   {phone}")
+        if url:   lines.append(f"   Link:    {url}")
+    return "\n".join(lines)
+
+
+# ── Vector store ───────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading pet profiles…")
 def get_vector_store() -> Chroma:
     if os.path.exists(".chroma_db"):
         return load_vector_store()
-    # Fall back to mock data if no index exists
     docs = load_pet_documents()
     return build_vector_store(docs)
 
@@ -205,13 +331,12 @@ with st.sidebar:
     st.divider()
 
     # Data source indicator
-    using_real_data = os.path.exists("data/pets.db")
-    if using_real_data:
+    if os.path.exists("data/pets.db"):
         try:
             from src.ingestion.metadata_store import MetadataStore
             db = MetadataStore()
             active = len(db.get_active_ids())
-            last = db.last_sync_summary()
+            last   = db.last_sync_summary()
             db.close()
             st.success(f"✅ Live data: {active} pets")
             if last:
@@ -221,6 +346,85 @@ with st.sidebar:
             st.info("📁 Using live data")
     else:
         st.info("📋 Using mock data (15 pets)\nAdd RescueGroups key to sync real animals.")
+
+    st.divider()
+
+    # ── Favorites panel ────────────────────────────────────────────────────────
+    favs = st.session_state["favorites"]
+    n    = len(favs)
+
+    st.markdown(f"### ⭐ Saved Pets ({n})")
+
+    if n == 0:
+        st.caption("Star a pet to save it here during your session.")
+    else:
+        for fav_key, fav_m in list(favs.items()):
+            fav_name = fav_m.get("name", "?")
+            fav_loc  = ", ".join(filter(None, [fav_m.get("city"), fav_m.get("state")]))
+            col_a, col_b = st.columns([4, 1])
+            with col_a:
+                st.caption(f"**{fav_name}** · {fav_loc}")
+            with col_b:
+                if st.button("✕", key=f"remove_{fav_key}", help="Remove"):
+                    del st.session_state["favorites"][fav_key]
+                    st.rerun()
+
+        st.divider()
+
+        # Individual downloads
+        st.caption("**Download individual profiles:**")
+        for fav_key, fav_m in favs.items():
+            fav_name    = fav_m.get("name", "pet")
+            fav_url     = _validate_adoption_url(fav_m) or fav_m.get("org_url", "")
+            fav_org     = fav_m.get("org_name", "")
+            fav_phone   = fav_m.get("org_phone", "")
+            fav_species = fav_m.get("species", "")
+            fav_breed   = fav_m.get("breed", "")
+            fav_age     = fav_m.get("age_group", "")
+            fav_loc     = ", ".join(filter(None, [fav_m.get("city"), fav_m.get("state")]))
+
+            profile = (
+                f"🐾 {fav_name} — {fav_breed}\n"
+                f"{'─' * 30}\n"
+                f"Species:  {fav_species}\n"
+                f"Age:      {fav_age}\n"
+                f"Size:     {fav_m.get('size', '—')}\n"
+                f"Energy:   {fav_m.get('energy_level', '—')}\n"
+                f"Location: {fav_loc}\n"
+            )
+            if fav_org:   profile += f"Shelter:  {fav_org}\n"
+            if fav_phone: profile += f"Phone:    {fav_phone}\n"
+            if fav_url:   profile += f"Link:     {fav_url}\n"
+
+            st.download_button(
+                label=f"⬇ {fav_name}",
+                data=profile,
+                file_name=f"pawmatch_{fav_name.lower().replace(' ', '_')}.txt",
+                mime="text/plain",
+                key=f"dl_{fav_key}",
+            )
+
+        st.divider()
+
+        # Batch downloads
+        st.caption("**Download all saved pets:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="⬇ CSV",
+                data=_build_favorites_csv(),
+                file_name="pawmatch_favorites.csv",
+                mime="text/csv",
+                key="dl_all_csv",
+            )
+        with col2:
+            st.download_button(
+                label="⬇ Text",
+                data=_build_favorites_text(),
+                file_name="pawmatch_favorites.txt",
+                mime="text/plain",
+                key="dl_all_txt",
+            )
 
     st.divider()
     st.markdown("**How it works**")
@@ -239,7 +443,6 @@ with st.sidebar:
 # ── Main UI ────────────────────────────────────────────────────────────────────
 st.title("🐾 PawMatch")
 st.caption("Describe your lifestyle — find your perfect shelter pet.")
-
 st.divider()
 
 example_prompts = [
@@ -262,6 +465,52 @@ query = st.text_area(
     placeholder="e.g. I live alone in a city apartment, work 9-5, and want a calm low-maintenance cat…",
 )
 
+# ── Location controls ─────────────────────────────────────────────────────────
+# Defaults — overridden inside the expander if user changes them
+search_zip   = st.session_state.get("search_zip_ui", "08817")
+radius_miles = st.session_state.get("radius_miles_ui", 25)
+
+with st.expander("📍 Search location & radius", expanded=False):
+    loc_col1, loc_col2 = st.columns([2, 1])
+    with loc_col1:
+        # Selectbox with NJ suggestions + custom option
+        location_options = ["📍 Use my custom ZIP"] + list(NJ_ZIP_SUGGESTIONS.keys())
+        location_choice  = st.selectbox("Select a location", location_options, index=1)
+
+        if location_choice == "📍 Use my custom ZIP":
+            custom_zip = st.text_input(
+                "Enter ZIP code", value="08817",
+                max_chars=5, placeholder="e.g. 07030"
+            ).strip()
+            search_zip = custom_zip if len(custom_zip) == 5 and custom_zip.isdigit() else "08817"
+        else:
+            search_zip = NJ_ZIP_SUGGESTIONS[location_choice]
+
+        # Validate ZIP
+        zip_coords = get_zip_coords(search_zip)
+        if zip_coords:
+            st.caption(f"✅ Searching from ZIP {search_zip}")
+        else:
+            st.caption(f"⚠️ ZIP {search_zip} not recognised — using Edison (08817)")
+            search_zip = "08817"
+
+    with loc_col2:
+        radius_miles = st.select_slider(
+            "Radius",
+            options=[10, 25, 50],
+            value=25,
+            format_func=lambda x: f"{x} mi",
+        )
+
+    st.caption(
+        f"Showing pets within **{radius_miles} miles** of **{search_zip}**. "
+        "Note: results depend on animals currently in the index. "
+        "Expand the radius if you see too few matches."
+    )
+    # Persist UI choices in session state
+    st.session_state["search_zip_ui"]   = search_zip
+    st.session_state["radius_miles_ui"] = radius_miles
+
 col1, col2 = st.columns([3, 1])
 with col1:
     top_k = st.slider("Number of matches", min_value=1, max_value=5, value=3)
@@ -275,11 +524,76 @@ if run and query.strip():
     vector_store = get_vector_store()
 
     with st.spinner("Searching pet profiles…"):
-        results = retrieve_pets(query, vector_store=vector_store, top_k=top_k)
-        context = format_context(results)
+        # Get postcodes within the user's requested radius
+        vs_meta      = vector_store._collection.get(include=["metadatas"])
+        all_postcodes = list({m.get("postcode","") for m in vs_meta["metadatas"] if m.get("postcode")})
+        nearby_pcs   = filter_postcodes_by_radius(all_postcodes, search_zip, radius_miles)
 
-    with st.spinner("Generating your personalised recommendation…"):
-        recommendation = generate_recommendation(query, context)
+        # Store location context regardless of results
+        st.session_state["search_zip"]      = search_zip
+        st.session_state["radius_miles"]    = radius_miles
+        st.session_state["nearby_count"]    = len(nearby_pcs)
+        st.session_state["last_search_zip"] = search_zip
+        st.session_state["last_radius"]     = radius_miles
+
+        # ── No nearby postcodes at all — skip retrieval entirely ──────────
+        if not nearby_pcs:
+            st.session_state["results"]        = []
+            st.session_state["recommendation"] = None
+        else:
+            # Fetch top_k for display + up to 10 more for "show more"
+            all_results = retrieve_pets(
+                query,
+                vector_store=vector_store,
+                top_k=min(top_k + 10, 15),
+                filter_postcodes=nearby_pcs,
+            )
+            results = all_results[:top_k]
+            context = format_context(results)
+
+            if not results:
+                st.session_state["results"]        = []
+                st.session_state["all_results"]    = []
+                st.session_state["recommendation"] = None
+            else:
+                with st.spinner("Generating your personalised recommendation…"):
+                    recommendation = generate_recommendation(query, context)
+                st.session_state["results"]        = results
+                st.session_state["all_results"]    = all_results
+                st.session_state["recommendation"] = recommendation
+                st.session_state["show_more"]      = False
+
+# ── Invalidate stale results when location/radius changes ─────────────────────
+if (search_zip  != st.session_state.get("last_search_zip") or
+    radius_miles != st.session_state.get("last_radius")):
+    if not run:   # don't clear if user just clicked Find My Match
+        st.session_state["results"]        = None
+        st.session_state["recommendation"] = None
+
+# Render from session state so results survive reruns
+if st.session_state.get("results") is not None:
+    results        = st.session_state["results"]
+    all_results    = st.session_state.get("all_results") or results
+    recommendation = st.session_state.get("recommendation")
+    sz  = st.session_state.get("search_zip", search_zip)
+    rm  = st.session_state.get("radius_miles", radius_miles)
+    nc  = st.session_state.get("nearby_count", 0)
+    SCORE_THRESHOLD = 0.28   # minimum similarity to show in "more" results
+
+    # ── Empty state ────────────────────────────────────────────────────────
+    if not results:
+        st.divider()
+        st.markdown("### 🔍 No matches found")
+        st.info(
+            f"No pets found within **{rm} miles** of **{sz}**. "
+            "Try expanding your radius to 25 or 50 miles, "
+            "searching from a nearby ZIP code, "
+            "or check back tomorrow when the index refreshes. "
+            f"({nc} animals currently indexed in your area.)"
+        )
+        st.stop()
+
+    st.caption(f"📍 Showing matches within {rm} miles of {sz} · {nc} animals in range")
 
     st.subheader("🏆 Your Personalised Recommendation")
     st.markdown(f'<div class="rec-box">{recommendation}</div>', unsafe_allow_html=True)
@@ -287,97 +601,18 @@ if run and query.strip():
     st.subheader("📋 Matched Pet Profiles")
 
     for rank, (doc, score) in enumerate(results, start=1):
-        import urllib.parse
-
         m            = doc.metadata
-        badges_html  = _build_badges(m)
-        meta_line    = _meta_line(m)
-        score_pct    = f"{score:.0%}"
-        photo_url    = m.get("photo_url", "")
-        org_name     = m.get("org_name", "")
-        city         = m.get("city", "")
-        state        = m.get("state", "")
         pet_name     = m.get("name", "?")
         breed        = m.get("breed", "?")
-        location     = ", ".join(filter(None, [city, state]))
-        # Only use adoption_url if it looks like an actual animal listing
-        # Don't fall through to org_url here — that's handled in the action block
-        adoption_url = m.get("adoption_url", "")
-        org_phone    = m.get("org_phone", "")
-        org_email    = m.get("org_email", "")
+        score_pct    = f"{score:.0%}"
+        photo_url    = m.get("photo_url", "")
+        adoption_url = _validate_adoption_url(m)
+        fav_key      = _favorite_key(m)
+        is_fav       = fav_key in st.session_state["favorites"]
 
-        # Validate adoption URL:
-        # 1. Must be a rescuegroups.org URL to count as a direct listing
-        # 2. If AnimalID= matches org_id, reconstruct with correct animal ID
-        from urllib.parse import urlparse
-        if adoption_url:
-            if "rescuegroups.org" not in adoption_url:
-                adoption_url = ""  # not a valid listing URL
-            elif "AnimalID=" in adoption_url:
-                url_animal_id = adoption_url.split("AnimalID=")[-1].strip()
-                org_id        = m.get("org_id", "")
-                rg_id         = m.get("rescuegroups_id", "")
-                if url_animal_id == org_id and url_animal_id != rg_id and rg_id:
-                    parsed       = urlparse(adoption_url)
-                    adoption_url = f"{parsed.scheme}://{parsed.netloc}/animals/detail?AnimalID={rg_id}"
-
-        # ── Build action block based on what data we have ─────────────────
-        if adoption_url:
-            # State 1 — direct link available
-            action_html = f'<div style="margin-top:10px"><a class="adopt-btn" href="{adoption_url}" target="_blank">&#128062; View on RescueGroups</a></div>'
-
-        else:
-            # States 2 & 3 — no direct link, build contextual next steps
-            steps = []
-
-            if org_name:
-                steps.append(
-                    f'<div class="next-step"><span class="next-step-icon">&#128222;</span>'
-                    f'<span>Call or visit <strong>{org_name}</strong> and ask about {pet_name}'
-                    + (f' &mdash; <a href="tel:{org_phone}">{org_phone}</a>' if m.get("org_phone") else "")
-                    + '</span></div>'
-                )
-
-            # Facebook / org website as a direct link if available
-            org_fb = m.get("org_url", "")
-            if org_fb and "facebook.com" in org_fb:
-                steps.append(
-                    f'<div class="next-step"><span class="next-step-icon">&#128279;</span>'
-                    f'<span><a href="{org_fb}" target="_blank">Find {org_name or "this shelter"} on Facebook</a></span></div>'
-                )
-            elif org_fb:
-                steps.append(
-                    f'<div class="next-step"><span class="next-step-icon">&#127968;</span>'
-                    f'<span><a href="{org_fb}" target="_blank">Visit {org_name or "shelter"} website</a></span></div>'
-                )
-
-            google_q   = " ".join(filter(None, [pet_name, breed, org_name or location, "adopt"]))
-            google_url = f"https://www.google.com/search?q={urllib.parse.quote(google_q)}"
-            steps.append(
-                f'<div class="next-step"><span class="next-step-icon">&#128269;</span>'
-                f'<span><a href="{google_url}" target="_blank">Search for {pet_name} on Google</a></span></div>'
-            )
-
-            rg_location = urllib.parse.quote(m.get("postcode") or "08817")
-            rg_species  = (m.get("species") or "cat").lower()
-            rg_url      = f"https://rescuegroups.org/adopt/?postalcode={rg_location}&miles=25"
-            steps.append(
-                f'<div class="next-step"><span class="next-step-icon">&#128196;</span>'
-                f'<span><a href="{rg_url}" target="_blank">Browse adoptable pets near {location or "Edison, NJ"} on RescueGroups</a></span></div>'
-            )
-
-            if not org_name:
-                steps.append(
-                    f'<div class="next-step"><span class="next-step-icon">&#128172;</span>'
-                    f'<span>Ask a local shelter if they have a {breed} or similar available</span></div>'
-                )
-
-            action_html = (
-                f'<div class="no-link-block">'
-                f'<div class="no-link-title">No direct listing &mdash; how to adopt {pet_name}</div>'
-                + "".join(steps)
-                + '</div>'
-            )
+        action_html  = _build_action_html(m, adoption_url)
+        badges_html  = _build_badges(m)
+        meta_line    = _meta_line(m)
 
         card_html = f"""
         <div class="match-card">
@@ -388,23 +623,104 @@ if run and query.strip():
         </div>
         """
 
-        # Layout: photo left, card right (only if photo exists)
+        # ── Layout ──────────────────────────────────────────────────────────
         if photo_url:
             img_col, card_col = st.columns([1, 2])
             with img_col:
                 st.image(photo_url, use_container_width=True)
             with card_col:
                 st.markdown(card_html, unsafe_allow_html=True)
+                star_label = "⭐ Saved" if is_fav else "☆ Save"
+                if st.button(star_label, key=f"fav_{fav_key}_{rank}"):
+                    _toggle_favorite(fav_key, m)
+                    st.rerun()
         else:
             st.markdown(card_html, unsafe_allow_html=True)
+            star_label = "⭐ Saved" if is_fav else "☆ Save"
+            if st.button(star_label, key=f"fav_{fav_key}_{rank}"):
+                _toggle_favorite(fav_key, m)
+                st.rerun()
 
-        # Full bio expander
         with st.expander(f"Read {pet_name}'s full bio"):
             bio_start = doc.page_content.find("Bio: ")
             bio = doc.page_content[bio_start + 5:] if bio_start != -1 else doc.page_content
             st.write(bio)
 
         st.write("")
+
+    # ── Show more button ──────────────────────────────────────────────────────
+    if not st.session_state.get("show_more"):
+        extra = [
+            (doc, score) for doc, score in all_results[len(results):]
+            if score >= SCORE_THRESHOLD
+        ]
+        if extra:
+            st.divider()
+            if st.button(
+                f"Show {len(extra)} more matches (above {SCORE_THRESHOLD:.0%} threshold)",
+                key="show_more_btn",
+            ):
+                st.session_state["show_more"] = True
+                st.rerun()
+    else:
+        # Render the extra results
+        extra = [
+            (doc, score) for doc, score in all_results[len(results):]
+            if score >= SCORE_THRESHOLD
+        ]
+        if extra:
+            st.divider()
+            st.subheader("📋 Additional Matches")
+            base_rank = len(results) + 1
+            for i, (doc, score) in enumerate(extra):
+                m            = doc.metadata
+                pet_name     = m.get("name", "?")
+                breed        = m.get("breed", "?")
+                score_pct    = f"{score:.0%}"
+                photo_url    = m.get("photo_url", "")
+                adoption_url = _validate_adoption_url(m)
+                fav_key      = _favorite_key(m)
+                is_fav       = fav_key in st.session_state["favorites"]
+
+                action_html  = _build_action_html(m, adoption_url)
+                badges_html  = _build_badges(m)
+                meta_line    = _meta_line(m)
+
+                card_html = f"""
+                <div class="match-card">
+                  <h4>#{base_rank + i} &middot; {pet_name} &mdash; {breed}</h4>
+                  <div class="meta">{meta_line} &middot; Match: {score_pct}</div>
+                  {badges_html}
+                  {action_html}
+                </div>
+                """
+
+                if photo_url:
+                    img_col, card_col = st.columns([1, 2])
+                    with img_col:
+                        st.image(photo_url, use_container_width=True)
+                    with card_col:
+                        st.markdown(card_html, unsafe_allow_html=True)
+                        star_label = "⭐ Saved" if is_fav else "☆ Save"
+                        if st.button(star_label, key=f"fav_{fav_key}_extra_{i}"):
+                            _toggle_favorite(fav_key, m)
+                            st.rerun()
+                else:
+                    st.markdown(card_html, unsafe_allow_html=True)
+                    star_label = "⭐ Saved" if is_fav else "☆ Save"
+                    if st.button(star_label, key=f"fav_{fav_key}_extra_{i}"):
+                        _toggle_favorite(fav_key, m)
+                        st.rerun()
+
+                with st.expander(f"Read {pet_name}'s full bio"):
+                    bio_start = doc.page_content.find("Bio: ")
+                    bio = doc.page_content[bio_start + 5:] if bio_start != -1 else doc.page_content
+                    st.write(bio)
+                st.write("")
+
+            if st.button("Show fewer", key="show_less_btn"):
+                st.session_state["show_more"] = False
+                st.rerun()
 
 st.divider()
 st.caption(
