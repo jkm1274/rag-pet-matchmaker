@@ -46,21 +46,17 @@ def _clean_supabase_url() -> str:
     return url
 
 
-def get_vector_store_supabase():
-    """Return a LangChain SupabaseVectorStore instance."""
-    from langchain_community.vectorstores import SupabaseVectorStore
-    from supabase import create_client
+class _SupabaseStore:
+    """Lightweight sentinel object representing the Supabase vector store.
+    All actual reads/writes go through direct HTTP in retriever.py and
+    vector_store.py to avoid the LangChain/postgrest client URL doubling bug.
+    """
+    def __repr__(self): return "SupabaseStore(direct-http)"
 
-    url = _clean_supabase_url()
-    key = os.environ["SUPABASE_KEY"]
 
-    client = create_client(url, key)
-    return SupabaseVectorStore(
-        client=client,
-        embedding=_embeddings(),
-        table_name="documents",
-        query_name="match_documents",
-    )
+def get_vector_store_supabase() -> _SupabaseStore:
+    """Return a sentinel — all Supabase operations use direct HTTP."""
+    return _SupabaseStore()
 
 
 def get_vector_store_chroma(persist_dir: str = ".chroma_db"):

@@ -46,19 +46,44 @@ def _retrieve_supabase(
     top_k: int,
     filter_postcodes: Optional[List[str]],
 ) -> List[Tuple[Document, float]]:
-    """Retrieve from Supabase pgvector."""
-    # Fetch more candidates when filtering
-    fetch_k = top_k * 4 if filter_postcodes else top_k
+    """Retrieve from Supabase via direct HTTP — bypasses LangChain client URL bug."""
+    import os, requests as req
+    from langchain_core.documents import Document
 
-    results = vector_store.similarity_search_by_vector_with_relevance_scores(
-        query_vector, k=fetch_k
+    url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    for s in ["/rest/v1", "/rest/v1/"]:
+        if url.endswith(s): url = url[:-len(s)]
+    key = os.getenv("SUPABASE_KEY", "")
+    headers = {
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+    }
+
+    fetch_k = min(top_k * 6, 200) if filter_postcodes else top_k * 2
+
+    resp = req.post(
+        f"{url}/rest/v1/rpc/match_documents",
+        headers=headers,
+        json={"query_embedding": query_vector, "filter": {}, "match_count": fetch_k},
+        timeout=20,
     )
 
+    if not resp.ok:
+        raise RuntimeError(f"Supabase match_documents failed: {resp.status_code} {resp.text[:200]}")
+
+    rows    = resp.json()
+    results = []
+
+    for row in rows:
+        meta     = row.get("metadata") or {}
+        content  = row.get("content", "")
+        score    = float(row.get("similarity", 0))
+        results.append((Document(page_content=content, metadata=meta), score))
+
     if filter_postcodes:
-        results = [
-            (doc, score) for doc, score in results
-            if doc.metadata.get("postcode") in filter_postcodes
-        ]
+        pc_set  = set(filter_postcodes)
+        results = [(doc, s) for doc, s in results if doc.metadata.get("postcode") in pc_set]
 
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:top_k]
