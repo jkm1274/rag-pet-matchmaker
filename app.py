@@ -15,6 +15,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import streamlit as st
+
+# ── Bridge Streamlit Cloud secrets → environment variables ────────────────────
+# On Streamlit Community Cloud, secrets are in st.secrets, not os.environ.
+# We copy them into os.environ so all downstream code (OpenAI, RescueGroups)
+# picks them up regardless of whether we're running locally or on the cloud.
+def _load_streamlit_secrets() -> None:
+    try:
+        for key in ["OPENAI_API_KEY", "RESCUEGROUPS_API_KEY",
+                    "SYNC_DISTANCE_MILES", "SYNC_MAX_PAGES"]:
+            if key in st.secrets and not os.environ.get(key):
+                os.environ[key] = str(st.secrets[key])
+    except Exception:
+        pass  # st.secrets not available locally — that's fine, .env handles it
+
+_load_streamlit_secrets()
 from langchain_chroma import Chroma
 
 from src.ingestion.ingest import build_vector_store, load_pet_documents, load_vector_store
