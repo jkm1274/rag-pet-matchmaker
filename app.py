@@ -412,6 +412,8 @@ with st.sidebar:
                 st.caption(f"Location: {last.get('location', '—')}")
         except Exception:
             st.info("📁 Using live data")
+    elif bool(os.getenv("RESCUEGROUPS_API_KEY")) and bool(os.getenv("OPENAI_API_KEY")):
+        st.info("🔄 Live data ready — will sync on first search.")
     else:
         st.info("📋 Using mock data (15 pets)\nAdd RescueGroups key to sync real animals.")
 
