@@ -1,6 +1,7 @@
 """
 src/retrieval/retriever.py
-Semantic search over ChromaDB with optional postcode radius filtering.
+Semantic search over ChromaDB or Supabase pgvector with optional
+postcode radius filtering.
 """
 
 from __future__ import annotations
@@ -11,35 +12,65 @@ load_dotenv()
 from typing import List, Optional, Tuple
 
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
-from src.ingestion.ingest import load_vector_store
+from src.ingestion.vector_store import use_supabase
 
 
 def retrieve_pets(
     query: str,
-    vector_store: Chroma | None = None,
+    vector_store=None,
     top_k: int = 3,
     filter_postcodes: Optional[List[str]] = None,
 ) -> List[Tuple[Document, float]]:
     """
     Return top_k (Document, similarity_score) tuples for a query.
-
-    Args:
-        query:            User lifestyle description.
-        vector_store:     Pre-loaded Chroma instance (lazy-loaded if None).
-        top_k:            Number of results to return.
-        filter_postcodes: If provided, only consider animals whose postcode
-                          is in this list. Used for location filtering.
+    Works with both ChromaDB and Supabase pgvector.
     """
     if vector_store is None:
-        vector_store = load_vector_store()
+        from src.ingestion.vector_store import get_vector_store
+        vector_store = get_vector_store()
 
     embeddings   = OpenAIEmbeddings(model="text-embedding-3-small")
     query_vector = embeddings.embed_query(query)
 
-    # Build ChromaDB where filter if postcodes specified
+    if use_supabase():
+        return _retrieve_supabase(query_vector, vector_store, top_k, filter_postcodes)
+    else:
+        return _retrieve_chroma(query_vector, vector_store, top_k, filter_postcodes)
+
+
+def _retrieve_supabase(
+    query_vector: list,
+    vector_store,
+    top_k: int,
+    filter_postcodes: Optional[List[str]],
+) -> List[Tuple[Document, float]]:
+    """Retrieve from Supabase pgvector."""
+    # Fetch more candidates when filtering
+    fetch_k = top_k * 4 if filter_postcodes else top_k
+
+    results = vector_store.similarity_search_by_vector_with_relevance_scores(
+        query_vector, k=fetch_k
+    )
+
+    if filter_postcodes:
+        results = [
+            (doc, score) for doc, score in results
+            if doc.metadata.get("postcode") in filter_postcodes
+        ]
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:top_k]
+
+
+def _retrieve_chroma(
+    query_vector: list,
+    vector_store,
+    top_k: int,
+    filter_postcodes: Optional[List[str]],
+) -> List[Tuple[Document, float]]:
+    """Retrieve from ChromaDB."""
     where = None
     if filter_postcodes:
         if len(filter_postcodes) == 1:
@@ -47,12 +78,14 @@ def retrieve_pets(
         else:
             where = {"postcode": {"$in": filter_postcodes}}
 
-    # Fetch more candidates when filtering so top_k results survive
-    n_results = top_k * 4 if filter_postcodes else top_k
+    n_results = min(
+        top_k * 4 if filter_postcodes else top_k,
+        vector_store._collection.count()
+    )
 
     kwargs = {
         "query_embeddings": [query_vector],
-        "n_results":        min(n_results, vector_store._collection.count()),
+        "n_results":        n_results,
         "include":          ["documents", "metadatas", "distances"],
     }
     if where:

@@ -33,6 +33,7 @@ _load_streamlit_secrets()
 from langchain_chroma import Chroma
 
 from src.ingestion.ingest import build_vector_store, load_pet_documents, load_vector_store
+from src.ingestion.vector_store import get_vector_store as get_persistent_vector_store, use_supabase
 from src.utils.location import (
     filter_postcodes_by_radius, get_zip_coords, NJ_ZIP_SUGGESTIONS
 )
@@ -348,39 +349,39 @@ def _build_favorites_text() -> str:
 
 # ── Vector store ───────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading pet profiles…")
-def get_vector_store() -> Chroma:
+def get_vector_store():
     """
-    Load or build the vector store.
+    Return the appropriate vector store:
+    - Supabase pgvector if SUPABASE_URL + SUPABASE_KEY are set (cloud, persistent)
+    - ChromaDB if local .chroma_db exists
+    - Mock CSV fallback if nothing else is available
+    """
+    # ── Supabase path — persistent, no cold start ──────────────────────────
+    if use_supabase():
+        logger.info("Using Supabase pgvector")
+        return get_persistent_vector_store()
 
-    On Streamlit Community Cloud the filesystem is ephemeral — .chroma_db
-    resets on every deploy. If both API keys are present we run a live sync
-    on cold start (takes ~2 min). Otherwise we fall back to the mock CSV
-    so the app is always usable even without API keys.
-    """
+    # ── ChromaDB path — local dev ──────────────────────────────────────────
     if os.path.exists(".chroma_db"):
         return load_vector_store()
 
-    has_rg_key = bool(os.getenv("RESCUEGROUPS_API_KEY"))
+    # ── Cold start fallback — only if no persistent store available ────────
+    has_rg_key  = bool(os.getenv("RESCUEGROUPS_API_KEY"))
     has_oai_key = bool(os.getenv("OPENAI_API_KEY"))
 
     if has_rg_key and has_oai_key:
-        # Cold start on cloud — run a fast single-anchor sync
         st.info(
-            "🔄 First run detected — syncing shelter data. "
-            "This takes about 2 minutes and only happens once per deploy."
+            "🔄 First run — syncing shelter data. "
+            "This takes about 5 minutes and only happens once per deploy."
         )
         try:
             from src.ingestion.sync import run_sync
-            run_sync(
-                anchors=[("08817", "Central NJ — cold start")],
-                distance=30,
-                max_pages=5,
-            )
+            run_sync(distance=30, max_pages=8)
             return load_vector_store()
         except Exception as e:
-            st.warning(f"Live sync failed: {e}")
+            st.warning(f"Sync failed: {e} — using mock data.")
 
-    # Fallback: mock CSV
+    # ── Final fallback — mock CSV ──────────────────────────────────────────
     docs = load_pet_documents()
     return build_vector_store(docs)
 
