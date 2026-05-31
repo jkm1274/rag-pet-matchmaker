@@ -47,6 +47,8 @@ if "show_more" not in st.session_state:
     st.session_state["show_more"] = False
 if "all_results" not in st.session_state:
     st.session_state["all_results"] = None
+if "filters" not in st.session_state:
+    st.session_state["filters"] = {}
 
 
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
@@ -152,6 +154,18 @@ def _build_badges(m: dict) -> str:
     return " ".join(badges)
 
 
+def _bio_quality(page_content: str) -> str:
+    """Return a warning badge HTML if the bio is suspiciously short."""
+    bio_start = page_content.find("Bio: ")
+    if bio_start == -1:
+        return '<span class="badge badge-gray">⚠️ Limited info</span>'
+    bio = page_content[bio_start + 5:].strip()
+    # A synthetic bio built purely from structured fields is typically < 200 chars
+    if len(bio) < 200:
+        return '<span class="badge badge-gray">⚠️ Limited info — call shelter</span>'
+    return ""
+
+
 def _meta_line(m: dict) -> str:
     parts = []
     species = m.get("species", "")
@@ -241,11 +255,13 @@ def _build_action_html(m: dict, adoption_url: str) -> str:
         f'<span><a href="{google_url}" target="_blank">Search for {pet_name} on Google</a></span></div>'
     )
 
-    rg_url = f"https://rescuegroups.org/adopt/?postalcode={urllib.parse.quote(postcode)}&miles=25"
+    # Search Google for adoptable pets near the shelter location
+    area_q   = " ".join(filter(None, [location or "NJ", "animal shelter adopt pet"]))
+    area_url = f"https://www.google.com/search?q={urllib.parse.quote(area_q)}"
     steps.append(
         f'<div class="next-step"><span class="next-step-icon">&#128196;</span>'
-        f'<span><a href="{rg_url}" target="_blank">'
-        f'Browse adoptable pets near {location or "Edison, NJ"} on RescueGroups</a></span></div>'
+        f'<span><a href="{area_url}" target="_blank">'
+        f'Find animal shelters near {location or "your area"} on Google</a></span></div>'
     )
 
     if not org_name:
@@ -511,6 +527,59 @@ with st.expander("📍 Search location & radius", expanded=False):
     st.session_state["search_zip_ui"]   = search_zip
     st.session_state["radius_miles_ui"] = radius_miles
 
+# ── Optional filters ──────────────────────────────────────────────────────────
+with st.expander("🔎 Filter by species, age & size", expanded=False):
+    f_col1, f_col2, f_col3 = st.columns(3)
+
+    with f_col1:
+        st.caption("**Species**")
+        filter_dogs = st.checkbox("🐕 Dogs", value=True, key="f_dogs")
+        filter_cats = st.checkbox("🐈 Cats", value=True, key="f_cats")
+        filter_other = st.checkbox("Other", value=True, key="f_other")
+
+    with f_col2:
+        st.caption("**Age group**")
+        filter_baby   = st.checkbox("Baby",   value=True, key="f_baby")
+        filter_young  = st.checkbox("Young",  value=True, key="f_young")
+        filter_adult  = st.checkbox("Adult",  value=True, key="f_adult")
+        filter_senior = st.checkbox("Senior", value=True, key="f_senior")
+
+    with f_col3:
+        st.caption("**Size**")
+        filter_small  = st.checkbox("Small",       value=True, key="f_small")
+        filter_medium = st.checkbox("Medium",       value=True, key="f_medium")
+        filter_large  = st.checkbox("Large",        value=True, key="f_large")
+        filter_xlarge = st.checkbox("Extra Large",  value=True, key="f_xlarge")
+
+    # Build filter dict
+    active_species = []
+    if filter_dogs:  active_species.append("Dog")
+    if filter_cats:  active_species.append("Cat")
+    if filter_other: active_species.extend(["Rabbit", "Bird", "Reptile", "Small & Furry", "Horse", "Barnyard"])
+
+    active_ages  = [a for a, v in [("Baby", filter_baby), ("Young", filter_young),
+                                    ("Adult", filter_adult), ("Senior", filter_senior)] if v]
+    active_sizes = [s for s, v in [("Small", filter_small), ("Medium", filter_medium),
+                                    ("Large", filter_large), ("Extra Large", filter_xlarge)] if v]
+
+    st.session_state["filters"] = {
+        "species": active_species,
+        "ages":    active_ages,
+        "sizes":   active_sizes,
+    }
+
+    all_species_checked = filter_dogs and filter_cats and filter_other
+    all_ages_checked    = filter_baby and filter_young and filter_adult and filter_senior
+    all_sizes_checked   = filter_small and filter_medium and filter_large and filter_xlarge
+    if not (all_species_checked and all_ages_checked and all_sizes_checked):
+        active_labels = []
+        if not all_species_checked: active_labels.append(", ".join(active_species) or "none")
+        if not all_ages_checked:    active_labels.append(", ".join(active_ages) or "none")
+        if not all_sizes_checked:   active_labels.append(", ".join(active_sizes) or "none")
+        st.caption(f"Filtering by: {' · '.join(active_labels)}")
+    else:
+        st.caption("No filters active — showing all species, ages, and sizes.")
+
 col1, col2 = st.columns([3, 1])
 with col1:
     top_k = st.slider("Number of matches", min_value=1, max_value=5, value=3)
@@ -541,15 +610,44 @@ if run and query.strip():
             st.session_state["results"]        = []
             st.session_state["recommendation"] = None
         else:
-            # Fetch top_k for display + up to 10 more for "show more"
-            all_results = retrieve_pets(
+            # Fetch generously then apply filters in Python
+            # (ChromaDB metadata filtering on multiple optional fields is complex;
+            # Python post-filtering is simpler and fast at this scale)
+            raw_results = retrieve_pets(
                 query,
                 vector_store=vector_store,
-                top_k=min(top_k + 10, 15),
+                top_k=min(top_k + 20, 30),
                 filter_postcodes=nearby_pcs,
             )
-            results = all_results[:top_k]
-            context = format_context(results)
+
+            # Apply species / age / size filters
+            filters = st.session_state.get("filters", {})
+            active_species = filters.get("species", [])
+            active_ages    = filters.get("ages",    [])
+            active_sizes   = filters.get("sizes",   [])
+
+            def _passes_filters(doc_meta):
+                if active_species:
+                    species = doc_meta.get("species", "")
+                    if species not in active_species:
+                        # Map common variants
+                        if species == "Cat" and "Cat" not in active_species: return False
+                        if species == "Dog" and "Dog" not in active_species: return False
+                        if species not in ("Cat", "Dog") and not any(
+                            s not in ("Cat", "Dog") for s in active_species
+                        ): return False
+                if active_ages:
+                    age = doc_meta.get("age_group", "")
+                    if age and age not in active_ages: return False
+                if active_sizes:
+                    size = doc_meta.get("size", "")
+                    if size and size not in active_sizes: return False
+                return True
+
+            filtered = [(doc, score) for doc, score in raw_results if _passes_filters(doc.metadata)]
+            all_results = filtered
+            results     = filtered[:top_k]
+            context     = format_context(results)
 
             if not results:
                 st.session_state["results"]        = []
@@ -557,7 +655,16 @@ if run and query.strip():
                 st.session_state["recommendation"] = None
             else:
                 with st.spinner("Generating your personalised recommendation…"):
-                    recommendation = generate_recommendation(query, context)
+                    from src.utils.location import get_zip_coords
+                    zip_coords = get_zip_coords(search_zip)
+                    loc_label  = f"ZIP {search_zip}"
+                    recommendation = generate_recommendation(
+                        user_query      = query,
+                        context         = context,
+                        location        = loc_label,
+                        radius          = radius_miles,
+                        active_filters  = st.session_state.get("filters"),
+                    )
                 st.session_state["results"]        = results
                 st.session_state["all_results"]    = all_results
                 st.session_state["recommendation"] = recommendation
@@ -612,13 +719,14 @@ if st.session_state.get("results") is not None:
 
         action_html  = _build_action_html(m, adoption_url)
         badges_html  = _build_badges(m)
+        quality_badge = _bio_quality(doc.page_content)
         meta_line    = _meta_line(m)
 
         card_html = f"""
         <div class="match-card">
           <h4>#{rank} &middot; {pet_name} &mdash; {breed}</h4>
           <div class="meta">{meta_line} &middot; Match: {score_pct}</div>
-          {badges_html}
+          {badges_html} {quality_badge}
           {action_html}
         </div>
         """
@@ -657,7 +765,7 @@ if st.session_state.get("results") is not None:
         if extra:
             st.divider()
             if st.button(
-                f"Show {len(extra)} more matches (above {SCORE_THRESHOLD:.0%} threshold)",
+                f"Show {len(extra)} more matches",
                 key="show_more_btn",
             ):
                 st.session_state["show_more"] = True
@@ -682,15 +790,16 @@ if st.session_state.get("results") is not None:
                 fav_key      = _favorite_key(m)
                 is_fav       = fav_key in st.session_state["favorites"]
 
-                action_html  = _build_action_html(m, adoption_url)
-                badges_html  = _build_badges(m)
-                meta_line    = _meta_line(m)
+                action_html   = _build_action_html(m, adoption_url)
+                badges_html   = _build_badges(m)
+                quality_badge = _bio_quality(doc.page_content)
+                meta_line     = _meta_line(m)
 
                 card_html = f"""
                 <div class="match-card">
                   <h4>#{base_rank + i} &middot; {pet_name} &mdash; {breed}</h4>
                   <div class="meta">{meta_line} &middot; Match: {score_pct}</div>
-                  {badges_html}
+                  {badges_html} {quality_badge}
                   {action_html}
                 </div>
                 """
@@ -726,5 +835,6 @@ st.divider()
 st.caption(
     "PawMatch is an AI-powered tool — recommendations are suggestions only. "
     "Always visit the shelter to meet your potential pet. "
-    "Pet availability changes daily."
+    "Pet availability changes daily.  |  "
+    "[Privacy Policy](/privacy)"
 )
