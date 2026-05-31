@@ -116,32 +116,59 @@ def _supabase_request(method: str, path: str, data=None) -> dict:
 
 
 def _upsert_supabase(docs: list, vector_store) -> None:
-    """Upsert into Supabase using direct HTTP calls to avoid client URL bugs."""
-    batch_size       = 100
+    """Upsert into Supabase using direct HTTP calls.
+    Uses small batches (10) to stay within Supabase free tier statement timeout.
+    """
+    import time
+    BATCH_SIZE       = 10   # small to avoid 8s statement timeout on free tier
+    MAX_RETRIES      = 3
     texts            = [d.page_content for d in docs]
     metas            = [d.metadata for d in docs]
     embeddings_model = _embeddings()
 
-    for i in range(0, len(docs), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        batch_metas = metas[i:i + batch_size]
-        vectors     = embeddings_model.embed_documents(batch_texts)
+    # Embed in larger batches (OpenAI handles 2048 at once efficiently)
+    all_vectors = []
+    for i in range(0, len(texts), 100):
+        all_vectors.extend(embeddings_model.embed_documents(texts[i:i+100]))
 
-        rows = []
-        for text, meta, vec in zip(batch_texts, batch_metas, vectors):
-            rows.append({
+    total = 0
+    for i in range(0, len(docs), BATCH_SIZE):
+        batch_texts = texts[i:i + BATCH_SIZE]
+        batch_metas = metas[i:i + BATCH_SIZE]
+        batch_vecs  = all_vectors[i:i + BATCH_SIZE]
+
+        rows = [
+            {
                 "content":         text,
                 "metadata":        meta,
                 "embedding":       vec,
                 "rescuegroups_id": meta.get("rescuegroups_id", ""),
-            })
+            }
+            for text, meta, vec in zip(batch_texts, batch_metas, batch_vecs)
+        ]
 
-        _supabase_request(
-            "POST",
-            "documents?on_conflict=rescuegroups_id",
-            data=rows,
-        )
-        logger.info("Upserted batch of %d into Supabase", len(rows))
+        for attempt in range(MAX_RETRIES):
+            try:
+                _supabase_request(
+                    "POST",
+                    "documents?on_conflict=rescuegroups_id",
+                    data=rows,
+                )
+                total += len(rows)
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 ** attempt
+                    logger.warning("Batch %d failed (%s), retrying in %ds…", i, e, wait)
+                    time.sleep(wait)
+                else:
+                    logger.error("Batch %d failed after %d retries: %s", i, MAX_RETRIES, e)
+                    raise
+
+        if total % 100 == 0:
+            logger.info("Upserted %d / %d into Supabase…", total, len(docs))
+
+    logger.info("Upserted %d documents into Supabase total", total)
 
 
 def _upsert_chroma(docs: list, vector_store) -> None:
