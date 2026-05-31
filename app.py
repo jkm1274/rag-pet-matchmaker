@@ -201,6 +201,31 @@ def _meta_line(m: dict) -> str:
     elif city:         parts.append(city)
     return " · ".join(parts)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_all_postcodes(_vs) -> list[str]:
+    """Fetch and cache all unique postcodes from the vector store."""
+    postcodes = set()
+    
+    # 1. Handle ChromaDB
+    if hasattr(_vs, "_collection"):
+        vs_meta = _vs._collection.get(include=["metadatas"])
+        for m in vs_meta.get("metadatas", []):
+            if m and m.get("postcode"):
+                postcodes.add(m.get("postcode"))
+                
+    # 2. Handle Supabase (Langchain SupabaseVectorStore)
+    elif hasattr(_vs, "client") and hasattr(_vs, "table_name"):
+        try:
+            # Query only the postcode from the metadata JSONB to minimize payload
+            res = _vs.client.table(_vs.table_name).select("metadata->postcode").execute()
+            for row in res.data:
+                pc = row.get("postcode")
+                if pc:
+                    postcodes.add(pc)
+        except Exception as e:
+            st.warning(f"Could not fetch postcodes from Supabase: {e}")
+            
+    return list(postcodes)
 
 def _validate_adoption_url(m: dict) -> str:
     """Return a valid RescueGroups adoption URL, reconstructing if misconfigured."""
@@ -615,10 +640,9 @@ if run and query.strip():
     vector_store = get_vector_store()
 
     with st.spinner("Searching pet profiles…"):
-        # Get postcodes within the user's requested radius
-        vs_meta      = vector_store._collection.get(include=["metadatas"])
-        all_postcodes = list({m.get("postcode","") for m in vs_meta["metadatas"] if m.get("postcode")})
-        nearby_pcs   = filter_postcodes_by_radius(all_postcodes, search_zip, radius_miles)
+        # Fetch postcodes using the cached helper to handle both Chroma and Supabase
+        all_postcodes = get_all_postcodes(_vs=vector_store)
+        nearby_pcs    = filter_postcodes_by_radius(all_postcodes, search_zip, radius_miles)
 
         # Store location context regardless of results
         st.session_state["search_zip"]      = search_zip
