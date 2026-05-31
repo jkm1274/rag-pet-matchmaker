@@ -358,7 +358,6 @@ def get_vector_store():
     """
     # ── Supabase path — persistent, no cold start ──────────────────────────
     if use_supabase():
-        logger.info("Using Supabase pgvector")
         return get_persistent_vector_store()
 
     # ── ChromaDB path — local dev ──────────────────────────────────────────
@@ -366,34 +365,10 @@ def get_vector_store():
         return load_vector_store()
 
     # ── Cold start fallback — only if no persistent store available ────────
-    has_rg_key  = bool(os.getenv("RESCUEGROUPS_API_KEY"))
-    has_oai_key = bool(os.getenv("OPENAI_API_KEY"))
-
-    if has_rg_key and has_oai_key:
-        st.info(
-            "🔄 First run — syncing shelter data. "
-            "This takes about 5 minutes and only happens once per deploy."
-        )
-        try:
-            from src.ingestion.sync import run_sync
-            run_sync(distance=30, max_pages=8)
-            return load_vector_store()
-        except Exception as e:
-            st.warning(f"Sync failed: {e} — using mock data.")
-
-    # ── Final fallback — mock CSV ──────────────────────────────────────────
-    docs = load_pet_documents()
-    return build_vector_store(docs)
-
-
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🐾 PawMatch")
-    st.caption("RAG-powered pet adoption matching")
-    st.divider()
-
-    # Data source indicator
-    if os.path.exists("data/pets.db"):
+    if use_supabase():
+        st.success("✅ Live data — Supabase pgvector")
+        st.caption("Tri-state area · updated nightly")
+    elif os.path.exists("data/pets.db"):
         try:
             from src.ingestion.metadata_store import MetadataStore
             db = MetadataStore()
@@ -403,13 +378,12 @@ with st.sidebar:
             st.success(f"✅ Live data: {active} pets")
             if last:
                 st.caption(f"Last sync: {last['finished_at'][:10] if last.get('finished_at') else 'unknown'}")
-                st.caption(f"Location: {last.get('location', '—')}")
         except Exception:
             st.info("📁 Using live data")
     elif bool(os.getenv("RESCUEGROUPS_API_KEY")) and bool(os.getenv("OPENAI_API_KEY")):
         st.info("🔄 Live data ready — will sync on first search.")
     else:
-        st.info("📋 Using mock data (15 pets)\nAdd RescueGroups key to sync real animals.")
+        st.info("📋 Using mock data (15 pets)")
 
     st.divider()
 
