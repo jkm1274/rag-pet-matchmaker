@@ -363,13 +363,6 @@ def get_vector_store() -> Chroma:
     has_rg_key = bool(os.getenv("RESCUEGROUPS_API_KEY"))
     has_oai_key = bool(os.getenv("OPENAI_API_KEY"))
 
-    # Debug — show what keys are available (remove after confirming working)
-    st.info(
-        f"🔑 Key check — RG: {'✅' if has_rg_key else '❌'} | "
-        f"OAI: {'✅' if has_oai_key else '❌'} | "
-        f"Secrets available: {list(st.secrets.keys()) if hasattr(st, 'secrets') else 'n/a'}"
-    )
-
     if has_rg_key and has_oai_key:
         # Cold start on cloud — run a fast single-anchor sync
         st.info(
