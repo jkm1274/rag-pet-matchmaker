@@ -37,12 +37,21 @@ def use_supabase() -> bool:
     return bool(os.getenv("SUPABASE_URL")) and bool(os.getenv("SUPABASE_KEY"))
 
 
+def _clean_supabase_url() -> str:
+    """Return the base Supabase URL with no trailing path."""
+    url = os.environ["SUPABASE_URL"].rstrip("/")
+    for suffix in ["/rest/v1", "/rest/v1/"]:
+        if url.endswith(suffix):
+            url = url[:-len(suffix)]
+    return url
+
+
 def get_vector_store_supabase():
     """Return a LangChain SupabaseVectorStore instance."""
     from langchain_community.vectorstores import SupabaseVectorStore
     from supabase import create_client
 
-    url = os.environ["SUPABASE_URL"]
+    url = _clean_supabase_url()
     key = os.environ["SUPABASE_KEY"]
 
     client = create_client(url, key)
@@ -94,13 +103,13 @@ def upsert_documents(docs: list, vector_store=None) -> None:
 def _supabase_request(method: str, path: str, data=None) -> dict:
     """Make a direct HTTP request to Supabase REST API, bypassing client URL issues."""
     import requests as req
+    # Strip any trailing /rest/v1 suffix — we always add it ourselves
     url = os.environ["SUPABASE_URL"].rstrip("/")
+    for suffix in ["/rest/v1", "/rest/v1/"]:
+        if url.endswith(suffix):
+            url = url[:-len(suffix)]
     key = os.environ["SUPABASE_KEY"]
-    # Ensure we use the correct REST path
-    if "/rest/v1" not in url:
-        full_url = f"{url}/rest/v1/{path}"
-    else:
-        full_url = f"{url}/{path}"
+    full_url = f"{url}/rest/v1/{path}"
 
     headers = {
         "apikey":        key,

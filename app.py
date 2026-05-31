@@ -616,7 +616,10 @@ def get_indexed_postcodes() -> list:
     """Fetch all unique postcodes from the index — cached 1hr to avoid repeated DB calls."""
     if use_supabase():
         import requests as _req
-        url  = os.getenv("SUPABASE_URL", "").rstrip("/")
+        _u   = os.getenv("SUPABASE_URL", "").rstrip("/")
+        for _s in ["/rest/v1", "/rest/v1/"]:
+            if _u.endswith(_s): _u = _u[:-len(_s)]
+        url  = _u
         key  = os.getenv("SUPABASE_KEY", "")
         resp = _req.get(
             f"{url}/rest/v1/documents?select=metadata&limit=10000",
